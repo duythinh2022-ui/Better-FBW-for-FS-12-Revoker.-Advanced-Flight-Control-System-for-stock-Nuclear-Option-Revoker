@@ -5,6 +5,8 @@ AI disclosure: Coding for this mod is entirely using AI, since idk how to write 
 
 Another FCS mods with all of the goodies like my Ifrit and F-22E FCS mods. INDI, carefree handling, easy post stall maneuvering, asymmetric weight compensation, envelope protection, and departure tolerance for damaged airframe. (no VMC for engine damage, since single engine LOL)
 
+This FCS mod includes a fix for the outer trailing elevons which were misaligned in vanilla. With stability assist off, roll input is still velocity vector roll, but pedal input will be pure body yaw. 
+
 
 [F-22E FCS mod](https://github.com/duythinh2022-ui/Advanced-flight-controls-addon-for-Aryx-s-F-22E-mod-for-Nuclear-Option.)
 
