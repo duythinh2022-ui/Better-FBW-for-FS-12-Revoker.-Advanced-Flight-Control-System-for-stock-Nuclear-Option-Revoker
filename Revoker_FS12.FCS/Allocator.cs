@@ -109,11 +109,32 @@ namespace Revoker_FS12.FCS
 			i22 = inv[2, 2];
 		}
 
+		// Revoker 0.4.0: the lateral residual is weighted in the VELOCITY frame, not the body frame. Of the two lateral
+		// errors the jet can make, only one makes sideslip: beta-dot = p sin a - r cos a, so the error about the
+		// velocity normal (dp sin a - dr cos a) is the sideslip acceleration itself, and the error about the velocity
+		// vector (dp cos a + dr sin a) is stability-axis roll, which does not. The roll weight (axisWeight.x) is the
+		// velocity-axis weight and the yaw weight (axisWeight.z) the velocity-normal one. Below ~10 deg AoA sin a ~ 0
+		// and the two frames coincide, so nothing changes there; at 70 deg they have swapped and the yaw priority
+		// follows the sideslip onto the body-roll axis - which is what the elevons make when they yaw the jet at high
+		// AoA. Kinematics only (measured AoA), no schedule, no new constant. slipFrame false = the body-frame weights.
+		public bool slipFrame;
+
+		public float slipSin;
+
+		public float slipCos = 1f;
+
 		private Vector3 E(Vector3 m)
 		{
 			float num = i00 * m.x + i01 * m.y + i02 * m.z;
 			float num2 = i10 * m.x + i11 * m.y + i12 * m.z;
-			return new Vector3(z: (i20 * m.x + i21 * m.y + i22 * m.z) * Mathf.Sqrt(axisWeight.z), x: num * Mathf.Sqrt(axisWeight.x), y: num2 * Mathf.Sqrt(axisWeight.y));
+			float num3 = i20 * m.x + i21 * m.y + i22 * m.z;
+			if (slipFrame)
+			{
+				float eV = num * slipCos + num3 * slipSin;
+				float eN = num * slipSin - num3 * slipCos;
+				return new Vector3(eV * Mathf.Sqrt(axisWeight.x), num2 * Mathf.Sqrt(axisWeight.y), eN * Mathf.Sqrt(axisWeight.z));
+			}
+			return new Vector3(z: num3 * Mathf.Sqrt(axisWeight.z), x: num * Mathf.Sqrt(axisWeight.x), y: num2 * Mathf.Sqrt(axisWeight.y));
 		}
 
 		private float Cost(Vector3 err)
@@ -383,7 +404,151 @@ namespace Revoker_FS12.FCS
 			}
 		}
 
+		// 2.41.0 reach pass. The solve places every effector at its command as if it were there now. A stab sent across its
+		// travel takes up to half a second to get there, and on the way it passes its lift peak: the nozzles were balanced
+		// against the stab's moment at the far end while the jet got the peak's. When an effector with reachTau is
+		// commanded further than its servo reaches in reachTau, its command stands (where it is going), and the rest are
+		// re-solved against the moment at the reachable position (where it will be).
+		public static bool ReachPass = true;
+
+		public int reachMoves;
+
+		private readonly List<Effector> rchE = new List<Effector>();
+		private readonly List<float> rchDest = new List<float>();
+		private readonly List<float> rchLo = new List<float>();
+		private readonly List<float> rchHi = new List<float>();
+		private readonly List<Effector> rchAll = new List<Effector>();
+		private readonly List<float> rchCmd0 = new List<float>();
+
+		public float lastCost;
+
 		public void Solve(List<Effector> effs, Vector3 target)
+		{
+			bool any = false;
+			if (ReachPass)
+			{
+				foreach (Effector e in effs)
+				{
+					if (e.active && e.reachTau > 0f) { any = true; break; }
+				}
+			}
+			if (!any)
+			{
+				SolveCore(effs, target);
+				return;
+			}
+			rchAll.Clear();
+			rchCmd0.Clear();
+			foreach (Effector e in effs)
+			{
+				rchAll.Add(e);
+				rchCmd0.Add(e.cmd);
+			}
+			SolveCore(effs, target);
+			if (!TwoHorizon)
+			{
+				ReachFrom(effs, target);
+				return;
+			}
+			// 2.42 (TwoHorizon): the destination plan (each stab sent where the solve wants it, the rest placed against where it will be in
+			// reachTau) against the reach plan (each stab only as far as it gets in reachTau, everything solved together): each scored over
+			// two horizons - the cost in reachTau and the cost once the stabs are where they were sent - and the cheaper kept. The
+			// destination plan's near cost is the reach solve's, its far cost the first solve's; the reach plan's is the same at both.
+			// The near horizon alone is the 1.8.14 stab rate bound; the far one alone, the 2.41 reach pass.
+			float jD = lastCost;
+			ReachFrom(effs, target);
+			if (rchE.Count == 0) return;
+			bool anyTH = false;
+			foreach (Effector e in rchE) if (e.twoHorizon) anyTH = true;
+			if (!anyTH) return;
+			float jR = lastCost;
+			thR.Clear();
+			foreach (Effector e in effs) thR.Add(e.cmd);
+			if (TwoHorizonPath)
+			{
+				// the destination plan's near cost over its whole transit: the stabs walked from where they are to where they were sent
+				// (the rest as the reach solve placed them), the moment error averaged along the way
+				Vector3 oth = Vector3.zero;
+				foreach (Effector e in effs) if (e.active && !rchE.Contains(e)) oth += e.MAt(e.cmd);
+				float acc = 0f;
+				for (int k = 1; k <= 8; k++)
+				{
+					float f = k / 8f;
+					Vector3 tot = oth;
+					for (int i = 0; i < rchE.Count; i++) { Effector e = rchE[i]; tot += e.MAt(e.now + f * (e.cmd - e.now)); }
+					acc += Cost(tot - target);
+				}
+				jR = Mathf.Max(jR, acc / 8f);
+			}
+			thLo.Clear(); thHi.Clear();
+			for (int i = 0; i < rchAll.Count; i++)
+			{
+				Effector e = rchAll[i];
+				thLo.Add(e.lo); thHi.Add(e.hi);
+				e.cmd = rchCmd0[i];
+				if (e.active && e.reachTau > 0f && e.twoHorizon)
+				{
+					float reach = Mathf.Max(1f, e.rate) * e.reachTau;
+					float lo = Mathf.Max(e.lo, Mathf.Min(e.now, e.hi) - reach), hi = Mathf.Min(e.hi, Mathf.Max(e.now, e.lo) + reach);
+					if (lo <= hi) { e.lo = lo; e.hi = hi; }
+				}
+			}
+			SolveCore(effs, target);
+			float jB = lastCost;
+			for (int i = 0; i < rchAll.Count; i++) { rchAll[i].lo = thLo[i]; rchAll[i].hi = thHi[i]; }
+			if (2f * jB <= jR + jD)
+			{
+				twoHorizonBound++;
+				return;   // the reach plan's commands are in place
+			}
+			for (int i = 0; i < rchAll.Count; i++) rchAll[i].cmd = thR[i];
+		}
+
+		public static bool TwoHorizon = true;
+		public static bool TwoHorizonPath = true;
+		public int twoHorizonBound;
+		private readonly List<float> thR = new List<float>();
+		private readonly List<float> thLo = new List<float>();
+		private readonly List<float> thHi = new List<float>();
+
+		// the reach pass from the commands now in place (the destinations); rchAll / rchCmd0 hold the pre-solve commands
+		private void ReachFrom(List<Effector> effs, Vector3 target)
+		{
+			rchE.Clear();
+			rchDest.Clear();
+			rchLo.Clear();
+			rchHi.Clear();
+			foreach (Effector e in effs)
+			{
+				if (!e.active || e.reachTau <= 0f) continue;
+				float reach = Mathf.Max(1f, e.rate) * e.reachTau;
+				if (Mathf.Abs(e.cmd - e.now) <= reach) continue;
+				rchE.Add(e);
+				rchDest.Add(e.cmd);
+				rchLo.Add(e.lo);
+				rchHi.Add(e.hi);
+			}
+			if (rchE.Count == 0) return;
+			reachMoves++;
+			for (int i = 0; i < rchAll.Count; i++) rchAll[i].cmd = rchCmd0[i];
+			for (int i = 0; i < rchE.Count; i++)
+			{
+				Effector e = rchE[i];
+				float reach = Mathf.Max(1f, e.rate) * e.reachTau;
+				float at = e.now + Mathf.Clamp(rchDest[i] - e.now, -reach, reach);
+				e.lo = e.hi = e.cmd = at;
+			}
+			SolveCore(effs, target);
+			for (int i = 0; i < rchE.Count; i++)
+			{
+				Effector e = rchE[i];
+				e.lo = rchLo[i];
+				e.hi = rchHi[i];
+				e.cmd = rchDest[i];
+			}
+		}
+
+		private void SolveCore(List<Effector> effs, Vector3 target)
 		{
 			act.Clear();
 			foreach (Effector eff in effs)
@@ -666,10 +831,32 @@ namespace Revoker_FS12.FCS
 			{
 				PairedSearch(target, ref vector2);
 			}
+			// Revoker 0.8.2: what the allocation leaves unmade of its target (telemetry: unR / unY)
+			resDbg = MomentSum() - target;
 			for (int num40 = 0; num40 < count; num40++)
 			{
 				act[num40].cmd = Mathf.Clamp((float)x[num40], act[num40].lo, act[num40].hi);
+				x[num40] = act[num40].cmd;
 			}
+			lastCost = Total(target);
+		}
+
+		// Revoker 0.8.2: the allocation's moment minus its target (body axes, N m), and the conversion to deg/s^2 (telemetry)
+		public Vector3 resDbg;
+
+		public Vector3 Accel(Vector3 m)
+		{
+			return new Vector3(i00 * m.x + i01 * m.y + i02 * m.z, i10 * m.x + i11 * m.y + i12 * m.z, i20 * m.x + i21 * m.y + i22 * m.z) * 57.29578f;
+		}
+
+		private Vector3 MomentSum()
+		{
+			Vector3 t = Vector3.zero;
+			for (int i = 0; i < act.Count; i++)
+			{
+				t += act[i].MAt((float)x[i]);
+			}
+			return t;
 		}
 
 		public static int CoordNewton = 1;

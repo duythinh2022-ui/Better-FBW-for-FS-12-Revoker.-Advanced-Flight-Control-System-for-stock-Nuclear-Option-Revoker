@@ -43,6 +43,14 @@ namespace Revoker_FS12.FCS
 			public int length;
 
 			public readonly Dictionary<string, int> ids = new Dictionary<string, int>();
+
+			// 0.4.3: what this plugin wrote at each id, to recognise its own charts after another plugin (the other FCS
+			// mods use the same scheme) appends to the shared table. Before, any length change counted as "the table was
+			// rebuilt": the F-22E and Revoker re-appended after each other on every Schedule call, without end, so the
+			// table and the per-tick copy kept growing (the gradual FPS loss with both mods in one mission).
+			public readonly Dictionary<string, float[]> liftOwn = new Dictionary<string, float[]>();
+
+			public readonly Dictionary<string, float[]> dragOwn = new Dictionary<string, float[]>();
 		}
 
 		private static readonly List<Entry> entries = new List<Entry>();
@@ -54,6 +62,8 @@ namespace Revoker_FS12.FCS
 		private static bool loggedError;
 
 		private static int loggedCharts;
+
+		private static int loggedKept;
 
 		public static int Register(Aircraft a)
 		{
@@ -109,8 +119,20 @@ namespace Revoker_FS12.FCS
 				State st = states.GetOrCreateValue(__instance);
 				if (st.length != __instance.liftCharts.Length)
 				{
-					// charts regenerated (new JobManager) or never extended: forget the old ids
-					st.ids.Clear();
+					// 0.4.3: the table changed length. Only a rebuild (new JobManager / charts regenerated) loses our charts;
+					// another plugin appending its own leaves them in place, so check ours before forgetting them.
+					int len0 = st.length;
+					if (!OwnChartsIntact(__instance, st))
+					{
+						st.ids.Clear();
+						st.liftOwn.Clear();
+						st.dragOwn.Clear();
+					}
+					else if (st.ids.Count > 0 && loggedKept < 4)
+					{
+						loggedKept++;
+						Plugin.Log.LogInfo($"Revoker FCS aero charts: table grew {len0 / StallStagger.ChartN} -> {__instance.liftCharts.Length / StallStagger.ChartN} (another plugin's charts); ours are intact, not re-added.");
+					}
 					st.length = __instance.liftCharts.Length;
 				}
 				List<Entry> need = null;
@@ -163,6 +185,42 @@ namespace Revoker_FS12.FCS
 			}
 		}
 
+		// 0.4.3: true when every chart this plugin registered is still at its id with exactly the values written there.
+		// Runs only when the table length changes (spawns), not per tick.
+		private static bool OwnChartsIntact(AeroJobSettings js, State st)
+		{
+			if (st.ids.Count == 0)
+			{
+				return true;
+			}
+			AJ_handleMath(js).Complete();
+			int len = js.liftCharts.Length;
+			if (js.dragCharts.Length != len)
+			{
+				return false;
+			}
+			foreach (KeyValuePair<string, int> kv in st.ids)
+			{
+				if (!st.liftOwn.TryGetValue(kv.Key, out float[] l) || !st.dragOwn.TryGetValue(kv.Key, out float[] d))
+				{
+					return false;
+				}
+				int off = kv.Value * StallStagger.ChartN;
+				if (off < 0 || off + StallStagger.ChartN > len)
+				{
+					return false;
+				}
+				for (int i = 0; i < StallStagger.ChartN; i++)
+				{
+					if (!js.liftCharts[off + i].Equals(l[i]) || !js.dragCharts[off + i].Equals(d[i]))
+					{
+						return false;
+					}
+				}
+			}
+			return true;
+		}
+
 		private static void Extend(AeroJobSettings js, State st, List<Entry> need)
 		{
 			AJ_handleMath(js).Complete();
@@ -185,6 +243,8 @@ namespace Revoker_FS12.FCS
 					drag[off + i] = cd[i];
 				}
 				st.ids[e.key] = off / StallStagger.ChartN;
+				st.liftOwn[e.key] = (float[])cl.Clone();
+				st.dragOwn[e.key] = (float[])cd.Clone();
 			}
 			NativeArray<float> oldL = js.liftCharts;
 			NativeArray<float> oldD = js.dragCharts;

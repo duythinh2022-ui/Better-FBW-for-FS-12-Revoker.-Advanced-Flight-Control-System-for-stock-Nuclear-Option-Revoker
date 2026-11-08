@@ -255,6 +255,7 @@ namespace Revoker_FS12.FCS
 
 		public override void Evaluate(ref EvalContext ctx)
 		{
+			nodeOn = false;
 			active = false;
 			if (!Valid)
 			{
@@ -324,7 +325,7 @@ namespace Revoker_FS12.FCS
 				teUp = ((LocalAoAAt(5f) < LocalAoAAt(-5f)) ? 1f : (-1f));
 				if (asymRange)
 				{
-					ApplyAsymRange();
+					ApplyAsymRange(teUp);
 				}
 			}
 			for (int i = 0; i < N; i++)
@@ -423,8 +424,19 @@ namespace Revoker_FS12.FCS
 					}
 				}
 			}
+			// Revoker 0.8.2 (AnchorLateral): the roll and yaw columns pass through the live moment at the surface's position (Effector.SetLiveNode)
+			nodeOn = false;
+			if (AnchorLateral)
+			{
+				SetLiveNode(now, Mnow);
+			}
+			anchorDbg = nodeOn ? nodeD : Vector3.zero;
 			active = true;
 		}
+
+		internal static bool AnchorLateral = true;
+
+		public Vector3 anchorDbg;
 
 		public Vector3 Eval(float delta, ref EvalContext ctx, out float localAoADeg)
 		{
@@ -530,9 +542,26 @@ namespace Revoker_FS12.FCS
 			return (c >= 0f) ? max : (0f - min);
 		}
 
-		private void ApplyAsymRange()
+		// Revoker 0.2.18: the asymmetric travel is applied from the geometry sign (GeoTeUp) when the surface has not seen 10 m/s
+		// of flow yet (teUp is learned from the flow only), so on the runway at a standstill the canards already have their
+		// +70 / -45 instead of +-45. GeoTeUp is the same definition as the flow-learned teUp (+1: a positive deflection raises the
+		// trailing edge), and the 0.2.8 rollout brake already relies on it.
+		public void EnsureAsymRange(Transform root)
 		{
-			if (teUp > 0f)
+			if (!asymRange)
+			{
+				return;
+			}
+			float g = GeoTeUp(root);
+			if (g != 0f)
+			{
+				ApplyAsymRange(g);
+			}
+		}
+
+		private void ApplyAsymRange(float sgn)
+		{
+			if (sgn > 0f)
 			{
 				max = rangeUp;
 				min = 0f - rangeDown;
@@ -547,7 +576,7 @@ namespace Revoker_FS12.FCS
 				grid[i] = min + (float)i * (max - min) / (float)(N - 1);
 			}
 			asymRange = false;
-			Plugin.Log.LogInfo($"Revoker FCS: {name} travel {min:0}/+{max:0} deg (trailing edge up is {(teUp > 0f ? "+" : "-")}).");
+			Plugin.Log.LogInfo($"Revoker FCS: {name} travel {min:0}/+{max:0} deg (trailing edge up is {(sgn > 0f ? "+" : "-")}).");
 		}
 
 		public float LocalAoAAt(float delta)

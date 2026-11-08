@@ -99,6 +99,7 @@ namespace Revoker_FS12.FCS
 
 		public override void Evaluate(ref EvalContext ctx)
 		{
+			nodeOn = false;
 			active = false;
 			if (!Valid)
 			{
@@ -150,8 +151,18 @@ namespace Revoker_FS12.FCS
 			Mnow = Eval(hingeNow, ref ctx, out localAoANow);
 			now = hingeNow;
 			rate = servo;
+			// Revoker 0.8.2 (AnchorLateral, as SurfaceEffector): the roll and yaw columns pass through the live moment at the hinge's
+			// position (Effector.SetLiveNode). The hinge's pitch column is left as it was.
+			nodeOn = false;
+			if (SurfaceEffector.AnchorLateral)
+			{
+				SetLiveNode(now, Mnow);
+			}
+			anchorDbg = nodeOn ? nodeD : Vector3.zero;
 			active = true;
 		}
+
+		public Vector3 anchorDbg;
 
 		private Vector3 Eval(float delta, ref EvalContext ctx, out float localAoADeg)
 		{
@@ -185,6 +196,11 @@ namespace Revoker_FS12.FCS
 		}
 
 		// host lift normal with no camber deflection (the airframe models leave the camber to this effector)
+		// Revoker 0.2.20: true while the FCS drives the hinge (CamberForce applies the inboard camber share only then)
+		public bool driving;
+
+		public Vector3 HingeAxisWorld => ((vis != null && vis.parent != null) ? vis.parent.rotation : Quaternion.identity) * visRest * Vector3.right;
+
 		public Quaternion HostRot0 => (hostLN != null) ? (((hostLN.parent != null) ? hostLN.parent.rotation : Quaternion.identity) * hostRest) : Quaternion.identity;
 
 		// this flap's moment (and its host camber increment) at deflection delta in a given flow, as SurfaceEffector.EvalFlow
@@ -253,9 +269,13 @@ namespace Revoker_FS12.FCS
 			}
 			hingeNow = Mathf.MoveTowards(hingeNow, Mathf.Clamp(target, min, max), servo * dt);
 			vis.localRotation = visRest * Quaternion.AngleAxis(hingeNow, Vector3.right);
+			driving = true;
 			if (hostLN != null)
 			{
-				hostLN.localRotation = hostRest * Quaternion.AngleAxis(((host != null && !host.IsDetached()) ? Plugin.FlapCamberK : 0f) * hingeNow, Vector3.right);
+				// Revoker 0.2.20: with ElevonStallStagger wing2's lift normal stays at rest; CamberForce applies the camber share on
+				// the inboard curve. Without it, the 0.2.0 lift-normal turn (wing2's own curve).
+				float kH = (!Plugin.StallStagger && host != null && !host.IsDetached()) ? Plugin.FlapCamberK : 0f;
+				hostLN.localRotation = hostRest * Quaternion.AngleAxis(kH * hingeNow, Vector3.right);
 			}
 		}
 
@@ -263,6 +283,7 @@ namespace Revoker_FS12.FCS
 		public void Release()
 		{
 			hingeNow = 0f;
+			driving = false;
 			if (vis != null)
 			{
 				vis.localRotation = visRest;

@@ -24,6 +24,13 @@ namespace Revoker_FS12.FCS
 
 		public float rate;
 
+		// 2.41.0: the allocator balances the other effectors against where this one will be within reachTau s (its servo's
+		// reach toward its command), not against the command itself. 0 = not used.
+		public float reachTau;
+
+		// 2.42 (Allocator.TwoHorizon): this effector's reach plan is scored against its destination plan
+		public bool twoHorizon;
+
 		public float mu = 0.0001f;
 
 		public float lam = 2E-05f;
@@ -100,7 +107,49 @@ namespace Revoker_FS12.FCS
 			}
 			int num2 = (int)num;
 			float num3 = num - (float)num2;
-			return M[num2] + (M[num2 + 1] - M[num2]) * num3;
+			Vector3 m = M[num2] + (M[num2 + 1] - M[num2]) * num3;
+			// Revoker 0.8.2 (AnchorLateral): the live point as an extra node of the table, between its two grid neighbours
+			if (nodeOn && num2 == nodeK)
+			{
+				float g0 = min + (float)num2 * Step;
+				float w = (c <= nodeC) ? ((nodeC > g0) ? ((c - g0) / (nodeC - g0)) : 1f) : ((g0 + Step > nodeC) ? ((g0 + Step - c) / (g0 + Step - nodeC)) : 1f);
+				m += nodeD * w;
+			}
+			return m;
+		}
+
+		// Revoker 0.8.2 (AnchorLateral): INDI builds its target on the live moment (sum Mnow); the allocator answers from this table,
+		// linear between grid points. Where the two disagree at the surface's position, the difference was added to every tick's
+		// target as if the pilot had asked for it, and the rate loop settled with a standing error of (mismatch) / (I K): a slow
+		// roll / yaw creep with the stick centred whenever a trim puts the left and right surfaces at different deflections (an
+		// engine out, a load, damage), where their errors stop cancelling. The surface sets its live point as a node of the roll
+		// and yaw columns: the table passes through the live moment there and is unchanged at every grid point, so it stays the
+		// table everywhere else (a whole-table shift, Ifrit 0.8.3, carried the error at 'now' to deflections far from it).
+		public bool nodeOn;
+
+		public int nodeK;
+
+		public float nodeC;
+
+		public Vector3 nodeD;
+
+		public void SetLiveNode(float c, Vector3 live)
+		{
+			nodeOn = false;
+			if (N < 2)
+			{
+				return;
+			}
+			float u = (c - min) / Step;
+			if (u <= 0f || u >= (float)(N - 1))
+			{
+				return;
+			}
+			Vector3 at = MAt(c);
+			nodeK = (int)u;
+			nodeC = c;
+			nodeD = new Vector3(live.x - at.x, 0f, live.z - at.z);
+			nodeOn = true;
 		}
 
 		public float FNAt(float c)

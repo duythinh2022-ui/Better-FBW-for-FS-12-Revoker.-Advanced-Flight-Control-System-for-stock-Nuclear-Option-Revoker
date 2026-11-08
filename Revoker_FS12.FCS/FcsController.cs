@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -8,6 +8,16 @@ namespace Revoker_FS12.FCS
 {
 	internal sealed class FcsController
 	{
+		// StickCancelsLimit (ported from F-22E FCS 2.44.0, Tom 4 Nov 20:26): "if i hold stick all the way back at max aoa, and the jet still can
+		// do positive pitch rate, then nothing happens; as soon as the only pitch rate that can hold that aoa is 0, that is the point the stick
+		// can cancel the protection". At the AoA limit the nose-down part of the limit's own command (the capture bound below the limit,
+		// protection above it) scales with 1 - stick / 0.9, as protection's push always did; a positive holding rate is never scaled. Before,
+		// below limit + 0.5 the aft-stick floor held the command at 0 and above it 1.9.5's 'pilot command' (the stick clamped by the capture
+		// bound) brought the bound's nose-down back through full aft: slowing with the flight path falling, the command cycled 0 <-> ~-12
+		// deg/s at ~2 Hz (F-22E 20:07 log). 1.9.5's rule keeps its purpose: a stick asking for more nose-down than protection still gets it.
+		internal static bool StickCancelsLimit = true;
+		private bool capAtLimU, capAtLimD;
+
 		public readonly Aircraft ac;
 
 		public readonly ControlInputs inputs;
@@ -57,6 +67,28 @@ namespace Revoker_FS12.FCS
 		private Lpf3 mNowF;
 
 		private Lpf3 accF;
+
+		// F-22E 2.30.0 port: air data at the CG. vCg = the mass-weighted velocity of every body (the same weighting as cg); the AoA,
+		// sideslip, TAS / IAS and the flight-path rates (omegaV, vDot) are read from it instead of the root rigidbody's velocity.
+		// nz stays the root body's. The root sits ahead of the CG on these jets (Ifrit ~0.62 m, Revoker ~0.95 m), so a yaw / pitch
+		// rate put a false sideslip / AoA of rate x arm / V on every read.
+		// Revoker 0.5.1: off by default. Bench (CG-to-CG comparison, the root sits 0.93 m BEHIND the CG on this jet): 2 of 20
+		// regression cases worse by more than the ~0.5 deg noise, both 65 deg AoA releases (peak sideslip 1.7 -> 2.8 and 1.1 -> 1.8
+		// deg), and 5 of 32 damage-suite cases. Logged both ways (alphaRoot/betaRoot, alphaCg/betaCg) for the flight to decide.
+		internal static bool AirDataAtCg = false;
+
+		internal static bool FlightPathAtCg = false;
+
+		public float alphaRoot, betaRoot, alphaCgDbg, betaCgDbg;
+
+		private Vector3 vCg;
+
+		private Vector3 vCgPrev;
+
+		private Lpf3 accCgF;
+
+		// F-22E 3.0.0 capacity estimator, stock-jet port (every effector grouped, sideslip-axis read): telemetry only
+		internal readonly CapacityEstimator capEst = new CapacityEstimator();
 
 		private Vector3 velPrev;
 
@@ -251,9 +283,7 @@ namespace Revoker_FS12.FCS
 
 		internal static float RollEndJerk = 0.35f;
 
-		internal static float BrakeYawCap = 1.3f;
 
-		internal static float RollEntryCoord = 0.5f;
 
 		// 2.1.0 sideslip-rate lead for the lateral guard (see LateralLaw)
 		internal static float SlipLeadT = 0.8f;
@@ -267,6 +297,12 @@ namespace Revoker_FS12.FCS
 		internal static float SlipGovSpan = 10f;
 
 		public float slipGovDbg = 1f;
+
+		private float latLagEff = 0.47f;
+
+		private float latLagYawNom = 0.47f;
+
+		public float slipLeadDbg;
 
 		public static bool GLimitAccelLead = true;
 
@@ -395,57 +431,128 @@ namespace Revoker_FS12.FCS
 
 		public float slipRateDbg;
 
-		public float sweepLimDbg;
-
-		internal static float SweepYawK = 0.5f;
+		// 2.23.0: stays 0.5. The sweep cap is the kinematic demand (a coordinated rotation pS needs pS cos AoA of body yaw per unit
+		// AoA, see LateralLaw) against half the yaw capacity; it is the binder of every released push-over from 65 deg once the AoA
+		// falls through ~55 deg (3 Nov 11:19 log, 47.5-48.1 s: 15-21 deg/s of AoA rate allowed against 20-23 of flight-path rotation
+		// = a pitch command of +4..+9). 1 removes that and doubles the bench's bottom sideslip (clean released push 600: 9.2 -> 21.3;
+		// 0.65: 13.3): the larger pitch demand takes the stabs as they return to pitch and the lateral axes lose the coordination.
+		internal static float SweepYawK = 0.7f;   // 2.27.0: 0.5 -> 0.7. Since 2.26.0 the kinematic cap acts on the HELD push only (released: scaled out, the follow pace paces). Tom (14:28): "for the held push-over the pitch-down is too slow, the sideslip is being kept too tight" - 14:23 log held pushes 135-201 kt: sideslip <= 2 deg of the 4 deg margin, AoA rate 15-20 deg/s against +12..+23 of flight-path rotation. Bench (its held pushes do not reach this cap): one-fin held 560 5.7 -> 9.3, push+roll 300 2.7 -> 3.2, pull-then-pushover 350 4.2 -> 4.8, push-then-pullthrough 450 7.5 -> 8.3; the 2.23.0 bisect at 1.0 doubled the released push's sideslip when this cap still paced it.
+		// 2.24.0: a cap on the sweep toward zero AoA may hold the nose, never turn it back: the pitch-rate command it leaves is bounded
+		// at zero (the AoA still falls at the flight-path rate). Where the deficit is real (11:19 log, 223-244 kt with 70-80 deg/s on,
+		// sideslip 5-6 deg and climbing) the honest AoA-rate cap of 14-19 deg/s sat under +20..+24 of flight-path rotation = a nose-UP
+		// command of +5..+18 with the stick full forward - Tom's hitch, whatever the pace behind it.
+		internal static bool SweepNoReverse = true;
+		internal static float SweepNoReverseStick = 0.2f;   // lateral stick fraction over which 'released' fades to 'held' (the floor and the delivered term are released-push devices; the held push keeps 2.10.0's accepted pace)
+		// 2.25.0: the floor on the held push too (Tom, 3 Nov 13:17: "sometimes it steps, sometimes it goes all the way to the hard stop then
+		// goes again, for both the released push-over and the held push-over" - 13:12 log, 122.0 s held push: qCmd -25 -> -13 -> 0 -> +7 ->
+		// -9 -> -36, body pitch rate +4 with the stick full forward). A positive pitch command with the stick forward is a hitch whatever
+		// the rotation behind it; what the held push loses in the bottom sideslip the shed cap's pace has to buy back.
+		internal static bool SweepNoReverseHeld = true;
+		// 2.34.0 (the push governor): the push side of the reference-capacity governor replaces the 2.5.8-2.27.0 push-over stack (the kinematic
+		// sweep cap and its delivered term, the shed cap and its follow pace, the crossing lead, the cap filters and slews, the released
+		// follow latch, its roll target and its yaw brake). Tom: "it limits the lateral rate when only the yaw is the bottleneck and the
+		// pitch rate when both yaw and roll are". A sweep toward zero AoA under a velocity roll pS drives the stability-axis yaw rate
+		// rS = r cos a - p sin a at pS x AoA-rate; the yaw (through cos a) and the roll (through sin a) turn it back. The yaw sheds at
+		// most capY: the velocity roll may come down no faster than (pS cos a AoA-rate - capY) / sin a (and must GROW when that is
+		// positive: the roll follows the yaw) - the lateral limit. Where the roll cannot grow that fast either (capX), the AoA rate is
+		// limited, and over the whole sweep the AoA may come no lower than atan(yaw left / body-roll ceiling) (released: 1.5 x the body
+		// roll at the push; held: the stick's target), closed on at PushGovDecel. Capacities: one 0.2 s filter, TradeCapShare of them for
+		// the pitch, all of the yaw for the lateral edge. Bench record: claude/Pushover_governor_2.34_dev_findings.md
+		// 2.35.3: the stack it replaced (and the PushGov switch back to it) is deleted; it had not run since 2.34.0.
+		internal static float PushGovCapTau = 0.2f;   // s: the governor's one capacity filter (the pace is one curve, not the estimator's tick-to-tick read - 2.25.0)
+		internal static float PushGovTau = 0.5f;      // s: the pace closes on the yaw-limited AoA over this time (when PushGovDecel = 0)
+		internal static bool PushGovNoStab = true;   // 2.34.1: plan the push on the yaw capacity without the stabs (see LateralLaw)
+		internal static float PushGovSlipK = 0.5f;    // x the PushoverSideslip allowance the pace may leave to the bottom
+		internal static float PushGovDecel = 40f;     // deg/s^2: the pace closes on a_min at this deceleration (sqrt(2 D gap)); 0 = over PushGovTau
+		internal static float PushGovRollK = 1.5f;    // the body roll may rise to this x the body roll it had when the sweep began
+		// 2.35.0 (PushPlan, Tom 22:19: "velocity vector roll bleeds while the pitch is smoothly slowed down for the push over"). The push
+		// is PLANNED once, when it starts, not re-paced every tick from the capacity read (2.34.0/2.34.1: a pace that follows a read
+		// swinging +-30 % in 0.3 s, sitting at the flight path's own 15-20 deg/s of rotation, hesitated). At the push: the yaw on board
+		// (less what PushPlanSlip deg of sideslip absorbs at the bottom) over the yaw the push will shed - from the logs, 77 push-overs
+		// 14:45-22:06, the mean shed from the push to 10 deg AoA was 28.6e-4 x IAS^2 (r 0.81 with IAS; the capacity reads 0.53-0.64)
+		// - gives the push time T; the body pitch rate is set to bring the AoA to 10 deg in T (less the flight path's rotation), ramped
+		// in at PushPlanJerk and then held; it may rise (never fall) at PushPlanRise when the yaw goes faster than planned. With the
+		// lateral stick released the velocity-vector roll bleeds to zero over the same T (not the stop law's brake). One number to tune
+		// the trade: PushPlanK (higher = faster push, more sideslip at the bottom).
+		internal static bool PushPlan = true;
+		internal static bool PushPlanStopsRoll = true;
+		internal static bool RudderReach = true;   // Revoker 0.7.0: the allocator's reach pass on the rudder (see the reachTau loop)   // Revoker 0.7.0: the plan bleeds a held roll as well as a released one
+		// Revoker 0.6.0: shed = PushPlanK0 + PushPlanK x IAS^PushPlanExp (deg/s^2, IAS m/s). The F-22E's shed is all aero (K0 0, K 0.028 from
+		// 93 push-overs). This jet's yaw at the top of a push is the yaw nozzle (thrust, no fade with speed) and the elevons on the sideslip
+		// axis: the 4 Nov 23:03 / 23:13 logs' 4 push-overs shed about the same at every IAS, so the fit is a constant: K0 40, K 0 (residual
+		// 3.9 deg/s^2 rms). Provisional: 4 samples, flown on 0.5.1. Refit as more push-overs are flown.
+		internal static float PushPlanK0 = 40f;
+		internal static float PushPlanK = 0f;
+		internal static float PushPlanExp = 1.5f;
+		// Revoker 0.6.0: the plan's sideslip allowance at the bottom is the push-over allowance Tom set for the stock jets (PushoverSideslip, 8;
+		// the F-22E plan uses 4). -1 = follow it.
+		internal static float PushPlanSlip = -1f;
+		internal static float PushPlanA0 = 20f;       // deg: the push is planned only from above this AoA
+		internal static float PushPlanQMin = 8f;      // deg/s: the nose always visibly moves
+		internal static float PushPlanJerk = 120f;    // deg/s^2: the planned rate is ramped in at this
+		internal static float PushPlanRise = 15f;     // deg/s^2: how fast it may rise when the yaw is ahead of the plan
+		internal static float PushPlanTMin = 0.6f;
+		internal static float PushPlanR0 = 15f;       // deg/s of body yaw on board at the push for it to be planned
+		internal static float PushPlanWvK = 1f;       // the flight path's rotation at the push counted against the planned AoA rate
+		internal static float PushPlanRelease = 60f;  // deg/s^2: the bound ramps out below 10 deg AoA
+		internal static bool PushPlanOwnsPitch = true;    // 2.36.0: under a plan the sweep caps (the 60 deg/s AoA-rate ceiling) stand aside; with PushPlanClipKey the allocator's pitch priority and the stabs' window read the plan's bound (2.35.1's try without ClipKey: 4.8 -> 11.2)
+		internal static bool PushPlanWinOff = true;
+		internal static bool PushPlanClipKey = true;      // 2.36.0: pitchNeedDn / sweepHoldWin read the plan's bound (see the pitch law)
+		// 2.40.0 (PushPlanHeld; 2.36.0's held-stick rule): a planned push owns the held lateral stick too, in place of the push governor's
+		// lateral band. The band paced the roll toward the stick's target by L = (pS cos a a' - capY) / sin a with capY the measured yaw
+		// capacity read, which swings +-30 % in 0.3 s (the 2.34.1 noise). Under a plan the same rule reads the plan's own yaw budget D,
+		// fixed at the push's start - D = max(capPlan, (Y0 - Yend) / T): the coordinated yaw of the rotation, Y = pS sin a, drained to its
+		// end (the held roll's coordinated yaw at 10 deg AoA) over the planned push time - and this tick's commanded AoA rate a'.
+		// Released stick: unchanged (the plan's linear bleed). 2.36.0 flown 09:03: "held push over is smooth".
+		internal static bool PushPlanHeld = true;
+		// 2.41.0 (PushPlanReachTau): through a planned push the allocator places the nozzles and wing surfaces against where each stab will
+		// be within this many seconds (its servo's reach toward its command), not against the command (Allocator.ReachPass). 11:01 log
+		// (2.40.0), 34.1 s: the window sent the left stab -25 -> +35 deg (0.45 s, through its lift peak); the allocator, seeing the stab
+		// already at +35 (nose-up), drove the nozzles -4 -> -9 deg nose-down while the stab gave its peak nose-down on the way: -34 deg/s
+		// flown against -26.8 asked. Hybrid replays, 59 released pushes: overshoot 6.8 -> 2.8 deg/s median, the mid-push step 3.9 -> 1.3,
+		// the body-roll rise 9.3 -> 4.8; sideslip 5.0 -> 7.4 median (the stab's transit roll pulse had been holding it down). 0 = off.
+		internal static float PushPlanReachTau = 0.1f;
+		// 2.44.0 (StickCancelsLimit, Tom 4 Nov 20:26): "if i hold stick all the way back at max aoa, and the jet still can do positive pitch
+		// rate, then nothing happens; as soon as the only pitch rate that can hold that aoa is 0, that is the point the stick can cancel the
+		// protection". At the AoA limit the nose-down part of the limit's own command (the capture bound below the limit, protection
+		// above it) scales with 1 - stick / 0.9, as protection's push always did; a positive holding rate is never scaled. Before, two
+		// rules disagreed at the limit: below limit + 0.5 the aft-stick floor held the command at 0, above it 1.9.5's 'pilot command'
+		// (the stick clamped by the capture bound) brought the bound's nose-down back through full aft. Slowing at 22-50 IAS with the
+		// flight path falling 1-8 deg/s (20:07 log, 143-154 s, 173-182 s) the command cycled 0 <-> -11..-13 deg/s at ~2 Hz, AoA
+		// 64.5-66.6, nozzles -13 <-> +16 deg. Now full aft holds zero rate there and the AoA rises with the falling flight path (bench,
+		// those segments: 112 / 85 deg at their ends); release and protection pushes. 1.9.5's rule keeps its purpose: a stick asking for
+		// more nose-down than protection (forward stick above the limit) still gets it.
 
 		internal static float SweepPs0 = 10f;
 
-		internal static float SweepPsSpan = 10f;
 
 		internal static float SweepFloor = 6f;
 
-		internal static float SweepOff = 999f;
 
-		internal static float SweepFreeBand = 4f;
 
-		internal static float SweepRollShare = 0.5f;
+
 
 		internal static bool SweepPosPullFree = true;
 
-		internal static float SweepPosPs0 = 80f;
 
-		internal static float SweepPosPsSpan = 60f;
 
 		internal static float SweepPosK = 0.25f;
 
 		internal static float SlipGovPs0 = 10f;
 
-		internal static float SlipGovPsSpan = 10f;
 
-		internal static float SlipGovLead = 0.3f;
 
-		internal static float PullGovStart = 0.7f;
 
-		internal static float PullGovStartFinLoss = 0.7f;
 
 		internal static float PullRollTradeFinLoss = 0.7f;
 
-		internal static float PullGovStopK = 1f;
 
-		internal static float PullGovAccK = 0.5f;
 
-		internal static bool UnloadOnLeadOnly = true;
 
-		internal static float PullGovStopA1 = 35f;
 
-		internal static float PullGovUnloadSpan = 0.5f;
 
-		internal static float PullGovUnloadRate = 20f;
 
-		internal static float PullGovFallRate = 8f;
 
-		internal static float PullGovRiseRate = 2f;
 
 		public float decelDbg;
 
@@ -476,11 +583,8 @@ namespace Revoker_FS12.FCS
 
 		internal static float DecelStabRelax = 0f;
 
-		internal static bool UnloadFadeFix = true;
 
-		internal static float UnloadA0 = 5f;
 
-		internal static float UnloadASpan = 10f;
 
 		internal static float DecelRise = 3f;
 
@@ -495,70 +599,479 @@ namespace Revoker_FS12.FCS
 
 		private float pullServoEx;
 
-		internal static float PullServoSlew = 30f;
 
-		internal static bool PullServoUseXs = false;
 
-		internal static float PullServoPs0 = 60f;
 
-		internal static float PullServoPs1 = 100f;
 
-		internal static float PullServoGovStart = 0.9f;
 
 		public float pullServoWDbg;
 
-		internal static bool PullServoAdd = false;
 
-		internal static bool PullServoBlend = false;
 
-		internal static bool PullServoMax = false;
 
-		internal static bool PullServoLeadByRoll = false;
 
-		internal static float PullServoSr0 = 5f;
 
-		internal static bool PullServoNoUnload = true;
 
 		internal static float RelLatRollPrio = 3f;
 
 		public float relLatPrioDbg = 1f;
 
-		internal static bool PullGovServo = true;
 
-		internal static float PullServoK = 3f;
 
-		internal static float PullServoTarget = 0.85f;
 
-		internal static float PullServoLead = 0.2f;
 
-		internal static bool PullServoShortLead = true;
 
 		public float pullXsDbg;
 
 		public float pullLeadDbg;
 
-		internal static float PullFFBoostRise = 6f;
 
-		internal static float PullFFBoostFall = 12f;
 
-		internal static float PullFFBoostLo = 0.5f;
 
-		internal static float PullFFBoostHi = 0.7f;
 
 		internal static float PullFFBoostIdle = 2f;
 
-		internal static float PullFFBoostSlipRate = 2f;
 
-		internal static bool PullFFBoostTrade = false;
 
-		internal static bool PullFFBoostTradeFF = true;
 
 		// 2.2.8 governor state
 		internal static float PullGovIdleRise = 4f;
 
 		internal static float PullTradeFloor = 30f;
 
+		// 2.4.17 roll-stop sideslip governor (see LateralLaw)
+		internal static float StopSlipYawUse = 1f;
+
+
+
+		internal static float YawSlewLeadK = 1f;
+
+		public float yawLeadDbg;
+
+		private float rCmdRateF;
+
+
+
+		private bool rCmdLeadInit;
+
+		// 2.5.0 reference governor on the commanded roll rate (see LateralLaw). The stop / reversal sideslip model fitted
+		// on the 30 Oct flight logs (200 stops and reversals, 3-40 deg AoA): peak sideslip after the stop = StopSlipBase +
+		// |pS| sin(AoA) cos(AoA) x (StopSlipTau0 + StopSlipTau1 x rudder load above StopSlipKnee), with the rudder load the share
+		// of the rudders' yaw on the roll's side (StopSlipHoldTau filter).
+		internal static float StopSlipBase = 2.0f;
+
+		internal static float StopSlipTau0 = 0.054f;
+
+		internal static float StopSlipTau1 = 0.22f;
+
+		internal static float StopSlipKnee = 0.7f;
+
+		// 2.5.2 yaw-reserve governor: rudder load (share of their yaw on the roll's side) above which the roll reference is
+		// trimmed, and below which it is released; the release rises at StopSlipReserveRiseK x the fall rate
+		internal static float StopSlipLoad = 0.8f;
+
+
+		internal static float StopSlipReserveRiseK = 0.5f;
+
+
+		// 2.21.0: the AoA-rise cap (StopSlipPitchK / Start / Lead / Close, StopSlipPinAB0 / 1) is deleted - see LateralLaw. The
+		// floor stays as the trade's pitch-share floor (deg/s of AoA rate)
+		internal static float StopSlipPitchFloor = 6f;
+
+		private float paceRDotLast;
+
+		// 2.6.4: the trade's split. PullRollTrade is the share of a rolling pull's yaw shortfall the roll gives up (the roll limit
+		// goes that far from pSmax toward the trade's target); the pitch gives up the rest - the AoA-rate ask is scaled so that the
+		// pair's sweep demand (pS cos AoA x AoA rate) fits the share: with the roll at R_r of pSmax and the demand needing R of it,
+		// the AoA rate is held to R / R_r of the ask. 1 = all roll (2.5.1-2.6.3: the remainder was simply uncovered - at 170-210 kt
+		// the roll sat at the 30-35 deg/s floor with the pitch at full rate, Tom: "the slower, the more pitch and less roll; not the
+		// way the old governor divided pitch and roll with the 0.7 trade"; 22:17 log); 0 = all pitch; your 0.7 = 70 / 30.
+		private float pullTradeAsk;
+		internal float tradeAlphaRate = -1f;
+
+		// 2.8.0: the trade from the measured capacity (CapacityEstimator) against the roll the stick asks, not the roll limit
+		// (15:02 log, 210.3 / 215.0 / 224.1 s: stick released, roll braking to zero, yaw idle, and the pitch still held to 30 deg/s
+		// for ~0.35 s while the slewed roll limit climbed back - the re-pull hitch). 2.10.0: the 2.7.x arithmetic is deleted.
+
+		// share of the measured yaw capacity a rolling sweep may spend before the trade cuts in
+		internal static float TradeCapShare = 0.7f;
+
+		// the AoA-rate cap the measured trade asks of the pitch this tick (-1: none), and the roll the stick asks before any cap
+		internal float tradeAlphaNew = -1f;
+
+		internal float pSAskStick;
+		public float tradeAlphaDbg;
+
+
+		internal static float StopSlipPitchFree = 60f;
+
+		private float stopSlipAbsF;
+
+		internal float yawSatAlphaRate = -1f;
+
+		// 2.5.5: the lateral governors (margin cap, yaw reserve, pace, pitch caps, trade, no-chase) act in the AoA/G and rate laws
+		// and, with the gear down, in the air (no wheel on the ground; GearDownSlipProtect as for the 2.4.13 limiters). 10:10 log:
+		// 51 s gear-down airborne, 20.9 deg of sideslip, every governor column idle.
+		private bool LatGovMode => Mode == FcsMode.AoAG || Mode == FcsMode.Rate || (Mode == FcsMode.GearDownRate && Plugin.GearDownSlipProtect && !gsAnyContact);
+
+		private float yawSatCapQ = 120f;
+
+		private float yawSatCapQLo = -120f;
+
+		internal float yawSatAlphaRateDn = -1f;
+
+		private bool yawSatCapOn;
+
+		public float yawSatPitchDbg;
+		private float sweepClipDbg;   // 2.36.0: the push's clip (ask - command) by the caps or the plan (see PushPlanClipKey)
+		private bool sweepClipOn;
+
+		// margin schedule: RollStopSideslip up to StopSlipAoALo, RollStopSideslip50 at 50, RollStopSideslip65 at 65, off past StopSlipAoAEnd
+		internal static float StopSlipAoALo = 10f;
+
+		internal static float StopSlipAoAEnd = 70f;
+
+		// the limit comes down at StopSlipFallK x (the rudders' braking yaw acceleration / sin AoA), within StopSlipFallMin..Max
+		// deg/s per s, so a falling limit is a roll the yaw can coordinate, never a stop of its own
+		internal static float StopSlipFallK = 0.35f;
+
+		internal static float StopSlipFallMin = 20f;
+
+
+		// while the trajectory is still accelerating into the roll (faster than this, deg/s^2) the limit does not come down:
+		// the rudders pin in every fast entry and unpin as the yaw catches up
+
+		// yaw-saturation hold (see LateralLaw)
+		internal static float StopSlipHoldTau = 0.08f;
+
+		public float stopSlipUDbg;
+
+		public float stopSlipPredDbg;
+
+		public float stopSlipMarginDbg;
+
+		private float rCmdCoordPrev;
+
+
+		public float noChaseDbg;
+
+		// no-chase and the yaw slew lead fade out over this AoA band (the one-axis high-AoA law owns the yaw there)
+		internal static float StopSlipA0 = 36f;
+
+		internal static float StopSlipA1 = 45f;
+
+
+		internal static float StopSlipRiseK = 1.5f;
+
+
+		public float stopSlipLimDbg = 999f;
+
+		public float stopSlipABDbg;
+
+		// 2.5.3 yaw-reach (pace) governor, RollGovernorReplaces >= 2 (see LateralLaw, after the roll trajectory step). The lateral
+		// pair's body-yaw demand (pS sin AoA + the sideslip correction's cos AoA share) may not get further from the measured yaw
+		// rate than the yaw axis can close within PaceHorizon: the yaw acceleration the jet is showing now (PaceAccelTau filter)
+		// times the horizon, plus what the rudders can add within it from where they are (their tables, slew-limited, at
+		// PaceRudderUse), plus PaceFloor deg/s for the loop's normal tracking error. The roll reference is clamped to that window.
+		internal static float PaceHorizon = 0.15f;
+
+		internal static float PaceFloor = 4f;
+
+		internal static float PaceRudderUse = 1f;
+
+		internal static float PaceAccelTau = 0.08f;
+
+		// below this |sin AoA| the roll's yaw share is too small for the window to mean anything
+		internal static float PaceSinMin = 0.05f;
+
+		internal static float PaceRollUse = 1f;
+
+		// Revoker 0.3.0: with the yaw and roll windows disjoint, the window of the axis that can move less toward the target
+		// stands (true); false = the F-22E 2.6.6 rule (the yaw window stands)
+		internal static bool PaceWeakAxis = true;
+
+		// Revoker 0.3.0: the roll window's reach from the roll effectors' tables and slews (true); false = F-22E 2.6.6 (aRollPos x horizon)
+		internal static bool PaceRollSlew = true;
+
+		// Revoker 0.3.0: the roll effectors' slew in use opens the pace window (true; telemetry rollGate)
+		internal static bool PaceRollGate = true;
+
+		private float[] rollEffPrev;
+
+		private bool rollEffInit;
+
+		private float rollLoadF;
+
+		public float rollLoadDbg;
+
+		// open-loop: share of the rudders' available yaw the trajectory's acceleration / braking may ask for (level 3)
+		internal static float PaceYawUse = 0.85f;
+
+		private float paceAccelCap = -1f;
+
+		// 1 = the open-loop cap / the rudder-usage gate fade out over the rudder fade (StopSlipA0..A1); 0 = they stand at every AoA
+
+
+		// 1 = the open-loop cap hands over to the one-axis law as the rudders fade (rudderAuth); 0 = 2.5.5 (cap at every AoA)
+
+		// false = keep the margin cap and the yaw-reserve governor under the pace governor (2.5.6 and before), for A/B
+		// 2.5.15 sideslip-tolerance probe: the airframe's own aero (every AeroPart at the game's per-part law, the surfaces at
+		// their present deflection) evaluated at the present AoA and a sweep of hypothetical sideslip, every SlipProbePeriod.
+		// Two bounds come out: the sideslip where the restoring yaw moment stops growing (directional stiffness gone - the
+		// departure boundary) and the sideslip where the rudders' or the roll surfaces' authority has fallen to SlipAuthFrac of
+		// its zero-sideslip value. The smaller, x SlipTolUse, caps the margin. Nothing entered: the tables are the craft's.
+		internal static float SlipProbePeriod = 0.5f;
+		internal static float SlipProbeStep = 4f;
+		internal static float SlipProbeMax = 20f;
+		internal static float SlipTolUse = 0.7f;
+		internal static float SlipAuthFrac = 0.5f;
+		internal static float SlipAuthUse = 0.5f;
+		private float slipSignR;
+		internal static float SlipTolTau = 0.5f;
+		private float slipProbeTimer;
+		private float slipTolF = 25f;
+		public float slipTolDbg = 25f;
+		public float slipDepDbg = 25f;
+		public float slipAuthDbg = 25f;
+		public float slipStiffDbg;
+
+		// 2.31.2 (telemetry only, drives nothing): the passive airframe, evaluated per part as the game does (AirframeMomentAt).
+		// psA*: the airframe's own roll / yaw acceleration now (surfaces where they are, no thrust; deg/s^2, x roll right, z yaw right)
+		// psD*: how that changes if the body rates go from (p, r) to this tick's (pCmd, rCmd) - the help (or opposition) the
+		//       measured term does not contain yet; cePass*: psD as capacity toward each side, and along the velocity-roll axis
+		// psL* / psN*: roll / yaw derivatives at the present state, per deg of sideslip (b) and per deg/s of p and r (0.1 s cadence)
+		internal static bool PassiveProbeOn = true;
+		internal static float PassiveDerivPeriod = 0.1f;
+		public float psAX, psAZ, psDX, psDZ, psLb, psNb, psLp, psNp, psLr, psNr;
+		public float cePassXP, cePassXN, cePassZP, cePassZN, cePassSP, cePassSN;
+		private float psDerivTimer;
+		private List<(ControlSurface cs, AeroPart host, AirfoilTable table)> psCamber;
+		private readonly Dictionary<AeroPart, float> psCdMin = new Dictionary<AeroPart, float>();
+		// 2.5.8 rate mode (RollPaceRateMode): the lever is the commanded roll rate, not the trajectory's acceleration or braking.
+		// The roll-rate target is capped at the rate whose stick reversal, run at the tuned acceleration / braking, the yaw can
+		// follow within the sideslip margin: the reversal swings the yaw demand by 2 pS sin AoA; the rudders first cross from
+		// where they are (slew) and then pull at their full yaw on the new side; the yaw-rate error that accumulates meanwhile,
+		// x cos AoA, is sideslip. PaceRateK scales the predicted sideslip (1 = kinematic, no credit for the airframe's own
+		// directional stiffness); PaceRateFloor is the least rate the cap leaves (deg/s).
+		internal static float PaceRateK = 1f;
+		internal static float PaceRateFloor = 10f;
+
+		// 2.6.9: the rate cap's blend weighted by rudderAuth (its model's validity); false = 2.6.8 (blend at every AoA)
+
+
+		// 2.6.9: the rate cap models the ramped reversal the law flies (false = the 2.5.8 step model)
+		internal static bool PaceRateRamp = true;
+
+		// bench: scale on the cap's rudder-crossing dead time (1 = 2.6.9)
+		internal static float RateCapTauK = 1f;
+
+		// 2.6.9: the cap's dead time is the travel to the deflection the reversal needs, not to the far stop
+		internal static bool RateCapNeedTravel = true;
+
+		// 2.6.11: the pace window reads the whole airframe's yaw - its usage for the gate, every effector's travel for the reach - at every AoA (false = rudders)
+
+		internal static bool PaceMarginReach = true;
+
+		// bench: false = no open-loop acceleration cap at any blend (the trajectory always runs at its tuned acceleration / braking)
+		internal static bool PaceAccelCapOn = true;
+
+		// 2.7.0 measured pace window (PaceMeasured). One governor on the commanded roll rate, from measured state and the
+		// allocator's own output - no effector tables beyond the deflections the allocator has actually commanded, no surface
+		// list, no rate cap, no blend, no open-loop acceleration cap. Each tick, for the yaw axis and the roll axis:
+		//   what the axis will have done by the end of PaceHorizon = its measured acceleration now (everything acting on the
+		//   airframe, passive and active) plus the increment still in flight toward the effectors' commands, as far as their
+		//   servos get within the horizon (the tables at the commanded deflection: the allocator's decision, not a hypothesis);
+		//   the sideslip margin still unused, spent at that acceleration (sqrt(2 a (margin - |beta|) / cos AoA) of yaw-rate lead);
+		//   PaceFloor for the loop's ordinary tracking error.
+		// The roll target may not ask the axis for more than that - but only while the axis measurably cannot keep up: the
+		// allocator reports the target unmet at the commands it gave (allocUnmet), or the commanded increment is further away
+		// than the servos reach within the horizon (slew). In a coordinated roll, a corkscrew, the falling leaf, nothing binds
+		// (no steady-state tax). Where an axis is out - rudders crossing their travel in a reversal, the stabs busy with the
+		// pull - the target is held to what the axis delivers and the trajectory still runs at its tuned acceleration / braking
+		// toward it (Tom's rule: the commanded rate is the only lever).
+
+		// deg/s^2 of unmet-plus-undelivered acceleration at which the gate starts (PaceSatDead) and is fully on (PaceSatDead + PaceSatSpan)
+		internal static float PaceSatDead = 5f;
+
+		// 2.7.2: the unmet acceleration, as a share of the axis's authority, at which it counts as fully saturated
+		internal static float PaceSatFrac = 0.25f;
+
+		internal static float PaceSatSpan = 40f;
+
+		// filter on the allocator's unmet report (s)
+		internal static float PaceSatTau = 0.05f;
+
+		// share of the axis's demonstrated acceleration (a decaying peak of |omega-dot|, PaceSeenTau) credited where nothing is
+		// yet committed: the margin lead and the release pace after a hold
+		internal static float PaceSeenUse = 0.5f;
+
+		internal static float PaceSeenTau = 3f;
+
+		// 2.7.1: lead allowed over the axis as a time at its capacity (s) - the sideslip rate accepted while the roll waits for it
+		internal static float PaceLeadT = -1f;   // 2.17.0: < 0 = 1 / KYaw (0.4 s at the default gain); 0.1 = the 2.7.1 value
+
+		private float paceRatePrev;
+
+		private bool paceRateInit;
+
+		// 2.7.0: the trajectory's acceleration law reads the stick's intent (a reversal is a reversal even while the window
+		// holds the target on the near side), so a governed reversal brakes at the reversal's tuned acceleration, never the stop's
+		internal static bool PaceRevIntent = true;
+
+		public Vector3 allocUnmet;
+
+		private Lpf3 allocUnmetF;
+
+		public float aYawSeen;
+
+		private float aRollSeen;
+
+		public float paceGateZDbg;
+
+		public float paceGateXDbg;
+
+		public float paceDzHDbg;
+
+		public float paceDzAllDbg;
+
+		public float paceDxHDbg;
+
+		public float paceDxAllDbg;
+
+		public float paceRHDbg;
+
+		public float pacePHDbg;
+
+		public float paceTgtRaw;
+
+		public float paceSeenZDbg;
+
+		private float paceBetaG;
+
+		public float paceMLeftDbg;
+
+		public float paceLoDbg;
+
+		public float paceHiDbg;
+
+		public float paceClampDbg;
+
+		// 2.20.0: the window's no-fin stop (the roll target held at the stopped-body-roll rotation r sin AoA; the yaw loop asked for its brake)
+		// Revoker 0.6.0: off on this jet. The F-22E device assumes that with the fins gone there is no yaw axis left but the stabs; here
+		// yawHealth reads the rudder and the fins, while the yaw nozzle and the elevons (the yaw axis at high AoA: elevon pair +-68 deg/s^2,
+		// rudder +-12 at 350 km/h / 70 deg) are untouched. Bench damage suite, rudder or fins+rudder detached: with it on, 4 held / released
+		// push-overs departed (sideslip 41-52 deg, AoA to -80..-93 after the release at -50) and the leaf stops made 13-17 deg against 0.5.1's
+		// 2-3; off, every damaged case is back to 0.5.1's (worst +0.8 deg), clean cases identical. Inert on the Ifrit's bench either way.
+		internal static bool PaceStopNoFin = false;
+
+		private float paceStopNF;
+
+		public float paceStopNFDbg;
+
+		public float paceCapZPDbg;
+
+		public float paceCapZNDbg;
+
+		public float paceCapXPDbg;
+
+		public float paceCapXNDbg;
+
+		public float paceHdZPDbg;
+
+		public float paceHdZNDbg;
+
+		// 2.7.2: passive directional stiffness credited to the reversal cap, as a share of the restoring yaw at the margin sideslip
+		internal static float PaceStiffUse = 1f;
+
+		// 2.7.1's target rate limit at the capacity (Tom, 10:19: felt as slowed deceleration - off)
+
+
+		internal static float PaceGateOn = 0.5f;
+
+		internal static float PaceGateOff = 0.25f;
+
+		private bool paceLatchZ;
+
+		private bool paceLatchX;
+
+		public float paceNEffDbg;
+
+		public float paceDdDbg;
+
+
+		private float revBlendF;
+
+		internal static float PaceMarginK = 1f;
+
+		public float paceMarginLeadDbg;
+
+		// 2.6.9: the pace window's gate reads the whole airframe's yaw usage past the rudder fade (false = rudder load only)
+
+		private float yawUseAllF;
+
+		private float rateBlendEffDbg;
+		// 2.5.12: the yaw the cap credits is derated by the allocator's own unmet-yaw report (yawSat, 0..1 over 10-50 deg/s^2
+		// unmet, 0.25 s filter): by PaceSatDerateHi of it past the rudder fade (the stabs are the yaw axis there and the tables
+		// overstate them 3-4x: 13:31 log, 55 s - a 64 deg/s roll allowed at 65 deg AoA, the release left 60 deg/s of yaw the
+		// axis shed at 25 deg/s^2, 11 deg as the AoA fell through 30), PaceSatDerateLo below it. "Not too much" (Tom).
+		internal static float PaceSatDerateHi = 0.5f;
+		internal static float PaceSatDerateLo = 0.25f;
+
+
+
+
+		// 2.6.6: 1 - cos AoA at which the shed cap stands at full strength (0.5 = 60 deg); the pace eases below it as holding buys less
+		internal static float SweepShedCos = 0.05f;   // 2.8.0: 0.5 -> 0.05, the cap stands at every AoA (Tom, 2 Nov: smooth over fast in the push-over)
+
+		// weight of the allocator's unmet yaw (yawSat) in the window's gate
+
+		// the window's gate releases over this (s); the rudders read zero usage for a few ticks as they swing through center
+		internal static float PaceGateTau = 0.3f;
+
+		private float paceGateF;
+
+		private float paceGateXF;
+		// 2.6.1: the window's release is paced by the yaw. The window holds the target while the rudders are loaded (PaceLoad0..1 of
+		// their yaw, 0.08 s filter) and let it go in one tick when they unloaded, into the full trade cap at the blended acceleration
+		// (300-720 deg/s^2 at blend 0.41): the yaw demand jumped, the rudders reloaded, the window held again - a 1.9 Hz hold /
+		// release cycle, +-5 deg/s on the target and +-5 deg on the rudders, in every corkscrew entry at 20-50 deg AoA once the
+		// 2.5.14 trade share gave the target room above the window (bench; 14:55 / 15:10 logs: pSTarget chatter 0.7 -> 3.0-3.7
+		// deg/s from 2.5.11). The hold may still come on in one tick (that is the protection); the climb back out of it may not
+		// ask the yaw for more than PaceYawUse of what the rudders can add toward the move's side (their tables, from where they
+		// are): roll-target rise x sin AoA = yaw acceleration. The trajectory's own acceleration and braking are untouched; this
+		// is the commanded rate, climbing out of a hold at the yaw's pace instead of in a step. PaceReleasePace 0 = 2.6.0.
+		// Only a hold with the roll already going the target's way is paced out (paceWinSame): a stick reversal's hold (the
+		// window keeps the new target at zero while the roll brakes through) is released as before, so the reversal still runs at
+		// the tuned acceleration (pacing it too took 450 km/h / 12-19 deg AoA reversals from 0.3 to 0.7-1.0 s on the bench).
+		private bool paceWinHeld;
+		private bool paceWinSame;
+		private float paceWinPrev;
+		public float paceRelDbg;
+		internal static float PaceReleasePace = 1f;
+
+		// the window applies as the rudders' usage (either side) runs from PaceLoad0 to PaceLoad1 of their yaw
+		internal static float PaceLoad0 = 0.5f;
+
+		internal static float PaceLoad1 = 0.75f;
+
+		private Lpf paceRDotF;
+
+		private Lpf pacePDotF;
+
+		private float paceOmegaZPrev;
+
+		private float paceOmegaXPrev;
+
+		private bool paceInit;
+
+		public float paceLeadDbg;
+
+		public float paceHoldDbg;
+		public float dbgWinLo, dbgWinHi, dbgWinLoR, dbgWinHiR, dbgReachPos, dbgReachNeg, dbgYawCorr, dbgWSat, dbgRateCap, dbgWin, dbgRollPos, dbgRDot, dbgPDot;
+
 		internal static float PullTradeFFK = 0.3f;
+		// 2.5.14: the share of the yaw authority an AoA sweep under a roll may spend, of the part the rudders are not using
+		internal static float PullTradeFreeK = 0.35f;
 
 		internal static float PullTradeFFIas0 = 93f;
 
@@ -572,24 +1085,17 @@ namespace Revoker_FS12.FCS
 
 
 
-		internal static bool PullFFBoostSlipFall = true;
 
-		internal static float PullFFBoostSlipT = 0f;
 
-		internal static bool PullFFBoostStatic = false;
 
-		internal static float PullFFBoostSLo = 0.25f;
 
-		internal static float PullFFBoostSHi = 0.65f;
 
 		private bool pullGovTouched;
 
 
 		internal static float GovCapTau = 0.3f;
 
-		private float govCapQ;
 
-		private bool govCapOn;
 
 		private float pullTradePs = 999f;
 
@@ -603,15 +1109,10 @@ namespace Revoker_FS12.FCS
 
 		public float slipGovPullDbg = 1f;
 
-		internal static float SweepPosFloor = 6f;
 
-		internal static float SweepPosLag0 = 3f;
 
-		internal static float SweepPosLag1 = 10f;
 
-		internal static float CoordJerkK = 0.35f;
 
-		internal static float CoordJerkFloor = 20f;
 
 		internal static float ToeLatRelease = 0.5f;
 
@@ -619,7 +1120,6 @@ namespace Revoker_FS12.FCS
 
 		public float toeTgtF;
 
-		internal static float RevYawCap = 0.9f;
 
 		public float coordJerkDbg;
 
@@ -633,6 +1133,26 @@ namespace Revoker_FS12.FCS
 
 		internal static float CoupGateA0 = 12f;
 
+		// 2.9.0 SweepHoldPitchPrio: the nose-down counterpart of OvershootPitchPriority. While the AoA-sweep cap holds the pitch-rate
+		// command above the stick's push (a push-over under a rotation the yaw cannot shed in time) and the nose drops faster than
+		// that command by SweepHoldErr0..+SweepHoldErrSpan deg/s, the pitch hold owns the stabilators (allocator pitch weight up,
+		// the released-roll priority off, the honest stab model, the nozzles free), as the run-away case does. 15:59 log (2.8.1),
+		// 46.3 / 87.9 s: push-over from 65 deg AoA at 225 kt with 72-79 deg/s of rotation; the cap asked -12 then +9 deg/s, the
+		// nose went down at 31 deg/s with the right stab at its +35 peak and the left at -8 (both on the roll stop, 240-280 deg/s^2
+		// of roll unmet at weight 1.3 against pitch's 7.5), AoA 40 -> 20 in 0.4 s against a nose-up command, 19.5 / 21.2 deg of
+		// sideslip at 25 -> 5 deg AoA from the 50 deg/s of yaw still on board. Tom: slow the pitch, not the rotation, at high AoA.
+		internal static float SweepHoldErr0 = 2f;
+
+		internal static float SweepHoldErrSpan = 8f;
+
+		// 2.9.2 SweepHoldStallWindow: during the capped sweep toward zero AoA, once the stabilators have pitch range back
+		// (stabPitchFrac > 0), they are held inside their attached window (local AoA <= lift peak + RpMainStallMargin), the
+		// 1.8.40 StallWindow. 16:37 log (2.9.1), 53.7 s: the right stab was parked at -30 (45 deg of local AoA) by the roll
+		// stop through 65 -> 50 deg while pitch was TVC-only; when the hold came (pitch weight 8, rate-bounded) the allocator
+		// had no nose-up gradient on a stab that deep past its stall - the honest model reads TE-up as un-stalling it (more
+		// tail lift, nose-down) - so it drove it further TE-down (-25) and put all the nose-up on the nozzles (+20, the stop);
+		// the nose went 37 -> 22 deg at -24 deg/s against +5..+10 commanded until the stab had been walked through (0.5 s).
+		// Inside the window the stabs have gradient the moment the hold needs them; the roll stop keeps what they give there.
 		internal static float CoupHeldGate = 1f;
 
 		internal static float CoupHeldDy0 = 0.04f;
@@ -938,6 +1458,419 @@ namespace Revoker_FS12.FCS
 		// Revoker 0.1.0: the nozzle's yaw axis
 		public TvcYawEffector tvcy;
 
+		// Revoker 0.3.0 (F-22E 2.6.6 reference governor, ported): the yaw axis the lateral governor counts on - the surfaces whose
+		// job is yaw (the rudder) and the yaw nozzle, each with its own yaw table, stops and slew. The F-22E's governor reads
+		// "the rudders" everywhere (the tables, the crossing time, the load); here that set is these effectors. The rudder's
+		// share fades with the fin (rudderAuth; 75-85 deg on this jet); the nozzle's yaw is thrust and holds at any AoA and
+		// IAS (speedFade above the vectoring speed, off under 3 m). The allocator's aYaw is not used as the capacity: it sums
+		// every effector's yaw table (canards, elevons, splits included) and read 1.5-2.2x what the rudder and nozzle at their
+		// stops delivered in the 30-31 Oct logs (calibrated plant: 58-91 deg/s^2 from the two, against aYaw 101-168; the plant's
+		// total yaw acceleration matched the logs to 2-9 deg/s^2 RMS, so the two are the yaw there).
+		private struct YawEff
+		{
+			public Effector e;
+			public float lo;
+			public float hi;
+			public float auth;
+			public bool rudder;
+		}
+
+		private readonly List<YawEff> yawEffs = new List<YawEff>(4);
+
+		public float yawCapDbg = 60f;
+
+		// Revoker 0.4.0: 1 = the probe's directional stiffness x margin / 2 is credited to the yaw capacity (see yawCapDbg); 0 = kinematic (F-22E)
+		internal static float PaceStiffCredit = 1f;
+
+		private float stiffCredit;
+
+		// Revoker 0.4.0: the airframe's yaw damping from the probe (SlipMomentAt with a yaw rate) credited to the yaw a reversal has to shed:
+		// a rotation r is braked by |Nr| r on its own, half of that on average over the swing to zero. The rate cap and the shed
+		// cap (the two that brake the yaw) take it; the pull and sweep caps (a growing demand, which the damping opposes) do not.
+		// 1 = credited; 0 = the F-22E's effectors-only model. SlipDampProbeRate: the yaw rate the probe perturbs by (rad/s).
+		internal static float PaceDampCredit = 1f;
+
+		internal static float SlipDampProbeRate = 0.35f;
+
+		private float slipDampF;
+
+		public float slipDampDbg;
+
+		private float dampCredit;
+		
+		// Revoker 0.4.0: the rate cap from a forward model of the reversal instead of the kinematic yaw-swing formula. Each tick, for a
+		// candidate velocity-vector roll rate pS, the governor reverses the jet in its head: the roll trajectory swings the demand
+		// from +pS to -pS at its own reversal acceleration; the rate loops (KRoll / KYaw, the sideslip hold at the loop's own
+		// gain) ask the effectors for roll and yaw; a small least-squares allocation over EVERY allocator effector (each from where
+		// it is, at its own slew, within its allocator window, its tables at the present flow, pitch held) delivers what it can;
+		// the body rates integrate with the airframe's sideslip stiffness in yaw and roll and its yaw damping (all three from the
+		// probe's tables); the sideslip follows the kinematics beta' = p sin a - r cos a. The largest pS whose reversal keeps the
+		// peak sideslip inside the margin is the cap. No effector set to pick by hand (the ailerons' yaw at 65 deg AoA counts as
+		// the rudder's at 10), and where the roll axis is as slow as the yaw the model says so instead of charging the yaw's lag.
+		// false = the kinematic formula (F-22E 2.5.8).
+		// Revoker 0.4.0: 1 = the allocator weighs the lateral residual in the velocity frame (Allocator.slipFrame); 0 = body frame (2.6.6)
+		internal static bool SlipFrameAlloc = true;
+
+		// Revoker 0.8.0: off - the steady-rate cap is the F-22E 3.0.0 reversal model, as on the Raptor (Tom, 5 Nov 01:21: "I thought the gov is
+		// airframe agnostic outside of the model"). RevSim, fed the estimator, sat at its 300 deg/s ceiling (01:23 log 54.1 s: 200 deg/s reversal
+		// with the pull 8 -> 27 deg AoA, RevSim predicted 1.3-5 deg of sideslip, the jet made 14.5). Bench with the 3.0.0 cap at the jet's
+		// RollPaceRateBlend 0.4: every regression case 0.3-3 deg less, sweep reversal worst 8.5 -> 6.2, stop 5.4 -> 3.9, corkscrews -0.7..-3.3
+		// (one +0.6), damage suite better or equal; the price is rate: sweep mean roll 113 -> 106, corkscrew velocity roll 10-50 deg/s lower,
+		// a clean leaf stop 1.73 -> 1.98 s. Replay of the 54.1 s reversal: 11.1 -> 6.7 deg.
+		internal static bool RevSim = false;
+		
+		// Revoker 0.4.1: the yaw-reach window's reach is computed over EVERY allocator effector, not the hand-picked yaw set
+		// (CollectYawEffs). The window holds the commanded roll to what the measured yaw can follow within PaceHorizon, so
+		// its reach is a statement about the airframe's yaw - and the hand-picked set leaves out the trailing edge, which is
+		// the yaw axis at moderate-to-high AoA on this jet (per-surface on the calibrated plant at 150 km/h / 65 deg AoA the
+		// aileron pair makes +-12.5 deg/s^2 of yaw against the tails' +-2.2). With the old set the reach read 5-6 deg/s in
+		// flight at 15-45 deg AoA and the window held the roll 12-14 deg/s under the stick while the sideslip sat at 2-5 deg
+		// of an 8 deg margin (1 Nov Ifrit 0.7.0 log). Each effector from where it is, at its own slew, inside its allocator
+		// window, its tables at the present flow, the same PaceRudderUse derate and one-side cap as before. The crossing
+		// time, the probe's authority and the yaw slew lead keep the dedicated set. false = the pre-Revoker 0.4.1 reach.
+		internal static bool PaceReachAll = true;
+		
+		public float paceReachDbg;
+		
+		// yaw moment (deg/s^2) every allocator effector can still add toward each side from where it is within the horizon,
+		// in the same two forms the window needs: the steady one-side yaw (nAv) and the horizon-integrated reach (g)
+		private void ReachAll(out float gPosA, out float gNegA, out float nAvPosA, out float nAvNegA)
+		{
+			gPosA = 0f;
+			gNegA = 0f;
+			nAvPosA = 0f;
+			nAvNegA = 0f;
+			foreach (Effector eR in effs)
+			{
+				if (eR == null || !eR.active || eR.M == null || eR.N < 2 || eR.rate <= 0f || eR.hi - eR.lo < 0.5f)
+				{
+					continue;
+				}
+				float nowR = Mathf.Clamp(eR.now, eR.lo, eR.hi);
+				float zNowR = AccYaw(eR.MAt(nowR));
+				float zHiR = AccYaw(eR.MAt(eR.hi));
+				float zLoR = AccYaw(eR.MAt(eR.lo));
+				float nSideR = 0.5f * Mathf.Abs(zHiR - zLoR);
+				nAvPosA += Mathf.Min(nSideR, Mathf.Max(0f, Mathf.Max(zHiR, zLoR) - zNowR));
+				nAvNegA += Mathf.Min(nSideR, Mathf.Max(0f, zNowR - Mathf.Min(zHiR, zLoR)));
+				for (int dR = -1; dR <= 1; dR += 2)
+				{
+					float tgtR = ((zHiR >= zLoR) == (dR > 0)) ? eR.hi : eR.lo;
+					float ddR = Mathf.Abs(tgtR - nowR);
+					float tsR = Mathf.Min(PaceHorizon, ddR / Mathf.Max(1f, eR.rate));
+					float dhR = nowR + Mathf.Sign(tgtR - nowR) * Mathf.Max(1f, eR.rate) * tsR;
+					float aSR = Mathf.Max(0f, (float)dR * (AccYaw(eR.MAt(dhR)) - zNowR));
+					float gR = 0.5f * aSR * tsR + aSR * (PaceHorizon - tsR);
+					if (dR > 0)
+					{
+						gPosA += gR;
+					}
+					else
+					{
+						gNegA += gR;
+					}
+				}
+			}
+		}
+		
+		internal static float RevSimDt = 0.02f;
+		
+		internal static float RevSimTmax = 3f;
+		
+		internal static float RevSimMax = 300f;
+		
+		public float revSimBetaDbg;
+		
+		public float revSimTDbg;
+		
+		public float revSimAtDbg;
+		
+		private struct RevEff
+		{
+			public float pHi;
+			public float qHi;
+			public float rHi;
+			public float pLo;
+			public float qLo;
+			public float rLo;
+			public float tHi;
+			public float tLo;
+		}
+		
+		private readonly List<RevEff> revEffs = new List<RevEff>(16);
+		
+		private float[] revX = new float[16];
+		
+		// the probe's signed sideslip slopes (deg/s^2 per deg of sideslip, in the tables' own sign): yaw and roll
+		public float slipYawSlopeDbg;
+		
+		public float slipRollSlopeDbg;
+		
+		private float slipYawSlopeF;
+		
+		private float slipRollSlopeF;
+		
+		internal static bool RevSimDump = false;
+
+		private void CollectRevEffs()
+		{
+			revEffs.Clear();
+			foreach (Effector e in effs)
+			{
+				if (e == null || !e.active || e.M == null || e.N < 2 || e.rate <= 0f || e.hi - e.lo < 0.5f)
+				{
+					continue;
+				}
+				float now = Mathf.Clamp(e.now, e.lo, e.hi);
+				Vector3 m0 = e.MAt(now);
+				Vector3 mH = e.MAt(e.hi) - m0;
+				Vector3 mL = e.MAt(e.lo) - m0;
+				RevEff x = default(RevEff);
+				x.pHi = AccRoll(mH);
+				x.qHi = IaInv[1, 1] * mH.y * 57.29578f;
+				x.rHi = AccYaw(mH);
+				x.pLo = AccRoll(mL);
+				x.qLo = IaInv[1, 1] * mL.y * 57.29578f;
+				x.rLo = AccYaw(mL);
+				x.tHi = Mathf.Max(0.01f, (e.hi - now) / Mathf.Max(1f, e.rate));
+				x.tLo = Mathf.Max(0.01f, (now - e.lo) / Mathf.Max(1f, e.rate));
+				revEffs.Add(x);
+				if (RevSimDump)
+				{
+					System.Console.WriteLine($"   reveff {e.name} now {now:F1} [{e.lo:F1},{e.hi:F1}] rate {e.rate:F0} hi p{x.pHi:F1} q{x.qHi:F1} r{x.rHi:F1} t{x.tHi:F2} | lo p{x.pLo:F1} q{x.qLo:F1} r{x.rLo:F1} t{x.tLo:F2}");
+				}
+			}
+			if (revX.Length < revEffs.Count)
+			{
+				revX = new float[revEffs.Count + 8];
+			}
+		}
+		
+		// peak |sideslip| (deg) of a full reversal from velocity-vector roll pS at the trajectory's reversal acceleration aT
+		private float RevSimBeta(float pS, float aT, float jT, float c, float sn, float kY, float kL, float nR, float g, out float tRev)
+		{
+			int n = revEffs.Count;
+			float dt = Mathf.Max(0.005f, RevSimDt);
+			float p = pS * c;
+			float r = pS * sn;
+			float r0 = r;
+			float beta = 0f;
+			float wd = pS;
+			float aRamp = 0f;
+			float peak = 0f;
+			tRev = RevSimTmax;
+			for (int i = 0; i < n; i++)
+			{
+				revX[i] = 0f;
+			}
+			float kRoll = Plugin.KRoll;
+			float kYaw = Plugin.KYaw;
+			for (float t = 0f; t < RevSimTmax; t += dt)
+			{
+				bool ramp = wd > 0f - pS;
+				// Revoker 0.4.1: the trajectory ramps its acceleration at the roll jerk limit and never reaches aT on a short swing -
+				// stepping straight to aT made the modelled reversal 3-4x more violent than the one the law actually flies
+				// (bench, Ifrit at 150 km/h / 35 deg AoA: model 127 deg/s^2 against a realized 27-35), and the cap came out
+				// 14-29 deg/s where the real reversal at 42 made 1.9 deg of sideslip against an 8 deg margin.
+				aRamp = Mathf.Min(aT, aRamp + jT * dt);
+				wd = Mathf.Max(0f - pS, wd - aRamp * dt);
+				// the law: rate commands (the sideslip hold rotates about the velocity normal: -g beta sin a of roll, +g beta cos a of yaw)
+				float pd = wd * c - g * beta * sn;
+				float rd = wd * sn + g * beta * c;
+				float ap = kRoll * (pd - p) + (ramp ? (0f - aRamp * c) : 0f);
+				float ar = kYaw * (rd - r) + (ramp ? (0f - aRamp * sn) : 0f);
+				// allocation: least squares over roll, pitch (held at zero) and yaw, each effector within [-1, 1] of its two moves,
+				// three Gauss-Seidel sweeps, then its slew
+				float sp = 0f;
+				float sq = 0f;
+				float sr = 0f;
+				for (int i = 0; i < n; i++)
+				{
+					RevEff e = revEffs[i];
+					float xi = revX[i];
+					if (xi >= 0f)
+					{
+						sp += xi * e.pHi;
+						sq += xi * e.qHi;
+						sr += xi * e.rHi;
+					}
+					else
+					{
+						sp -= xi * e.pLo;
+						sq -= xi * e.qLo;
+						sr -= xi * e.rLo;
+					}
+				}
+				for (int sweep = 0; sweep < 3; sweep++)
+				{
+					for (int i = 0; i < n; i++)
+					{
+						RevEff e = revEffs[i];
+						float xi = revX[i];
+						// residual without this effector
+						float ep;
+						float eq;
+						float er;
+						if (xi >= 0f)
+						{
+							ep = ap - (sp - xi * e.pHi);
+							eq = 0f - (sq - xi * e.qHi);
+							er = ar - (sr - xi * e.rHi);
+						}
+						else
+						{
+							ep = ap - (sp + xi * e.pLo);
+							eq = 0f - (sq + xi * e.qLo);
+							er = ar - (sr + xi * e.rLo);
+						}
+						float nH = e.pHi * e.pHi + e.qHi * e.qHi + e.rHi * e.rHi;
+						float nL = e.pLo * e.pLo + e.qLo * e.qLo + e.rLo * e.rLo;
+						float xH = (nH > 1E-06f) ? Mathf.Clamp01((ep * e.pHi + eq * e.qHi + er * e.rHi) / nH) : 0f;
+						float xL = (nL > 1E-06f) ? Mathf.Clamp01((ep * e.pLo + eq * e.qLo + er * e.rLo) / nL) : 0f;
+						float cH = (ep - xH * e.pHi) * (ep - xH * e.pHi) + (eq - xH * e.qHi) * (eq - xH * e.qHi) + (er - xH * e.rHi) * (er - xH * e.rHi);
+						float cL = (ep - xL * e.pLo) * (ep - xL * e.pLo) + (eq - xL * e.qLo) * (eq - xL * e.qLo) + (er - xL * e.rLo) * (er - xL * e.rLo);
+						float xNew = (cH <= cL) ? xH : (0f - xL);
+						// slew: from where it is, at its own rate
+						float lim = (xNew > xi) ? (dt / ((xi >= 0f) ? e.tHi : e.tLo)) : (dt / ((xi > 0f) ? e.tHi : e.tLo));
+						xNew = Mathf.Clamp(xNew, xi - lim, xi + lim);
+						if (xNew >= 0f)
+						{
+							sp += xNew * e.pHi - ((xi >= 0f) ? (xi * e.pHi) : (0f - xi * e.pLo));
+							sq += xNew * e.qHi - ((xi >= 0f) ? (xi * e.qHi) : (0f - xi * e.qLo));
+							sr += xNew * e.rHi - ((xi >= 0f) ? (xi * e.rHi) : (0f - xi * e.rLo));
+						}
+						else
+						{
+							sp += (0f - xNew * e.pLo) - ((xi >= 0f) ? (xi * e.pHi) : (0f - xi * e.pLo));
+							sq += (0f - xNew * e.qLo) - ((xi >= 0f) ? (xi * e.qHi) : (0f - xi * e.qLo));
+							sr += (0f - xNew * e.rLo) - ((xi >= 0f) ? (xi * e.rHi) : (0f - xi * e.rLo));
+						}
+						revX[i] = xNew;
+					}
+				}
+				// the airframe: effectors + sideslip stiffness (yaw and roll) + yaw damping on the yaw-rate change
+				float accP = sp + kL * beta;
+				float accR = sr + kY * beta + nR * (r - r0);
+				p += accP * dt;
+				r += accR * dt;
+				beta += (p * sn - r * c) * dt;
+				if (RevSimDump && pS == RevSimMax && ((int)(t / dt + 0.5f)) % 10 == 0)
+				{
+					System.Console.WriteLine($"   revsim t{t:F2} wd{wd:F0} p{p:F1} r{r:F1} beta{beta:F2} ap{ap:F0} ar{ar:F0} sp{sp:F0} sq{sq:F0} sr{sr:F0} x[{string.Join(",", System.Linq.Enumerable.Select(System.Linq.Enumerable.Take(revX, n), v => v.ToString("F2")))}]");
+				}
+				float ab = Mathf.Abs(beta);
+				if (ab > peak)
+				{
+					peak = ab;
+				}
+				if (peak > 60f)
+				{
+					break;
+				}
+				if (p * c + r * sn <= -0.9f * pS)
+				{
+					tRev = t;
+					break;
+				}
+			}
+			return peak;
+		}
+		
+		// the largest velocity-vector roll rate whose full reversal stays inside the sideslip margin (bisection over the forward model)
+		private float RevSimCap(float margin, float c, float sn, float aPace)
+		{
+			CollectRevEffs();
+			if (revEffs.Count == 0)
+			{
+				return PaceRateFloor;
+			}
+			float cA = Mathf.Max(Mathf.Abs(c), 0.05f);
+			// the trajectory's reversal acceleration, as the roll law sets it (RevFloorK x roll authority, in velocity-roll terms)
+			float aT = Mathf.Max(20f, ((ReversalFloor && RevConst) ? (RevFloorK * aRoll) : (Plugin.RollBrakeUse * (BrakeUseAll ? Mathf.Min(aRollPos, aRollNeg) : aRollWing))) / cA);
+			// Revoker 0.6.0 (as Ifrit 0.7.2): the reversal the governor flies is paced by the yaw the effectors can add (the estimator's,
+			// PaceYawUse of it over sin AoA); simulating an unpaced full-stick reversal and capping on that double-counts the protection
+			if (aPace > 0f)
+			{
+				aT = Mathf.Min(aT, aPace);
+			}
+			revSimAtDbg = aT;
+			// Revoker 0.4.1: the trajectory's own roll-jerk limit (the a2 of the lateral law), in velocity-roll terms
+			float jT = Mathf.Max(1f, Mathf.Min(aT / Mathf.Max(0.01f, RollJerkTau), RollJerkServo * aRoll * rollSlew / cA));
+			float kY = slipYawSlopeF;
+			float kL = slipRollSlopeF;
+			float nR = (PaceDampCredit > 0f) ? Mathf.Min(0f, slipDampF) : 0f;
+			float g = Mathf.Max(0f, slipGainDbg);
+			float lo = 0f;
+			float hi = RevSimMax;
+			float bHi = RevSimBeta(hi, aT, jT, c, sn, kY, kL, nR, g, out float tH);
+			if (bHi * Mathf.Max(0.1f, PaceRateK) <= margin)
+			{
+				revSimBetaDbg = bHi;
+				revSimTDbg = tH;
+				return hi;
+			}
+			float bLo = 0f;
+			float tLo = 0f;
+			for (int it = 0; it < 8; it++)
+			{
+				float mid = 0.5f * (lo + hi);
+				float b = RevSimBeta(mid, aT, jT, c, sn, kY, kL, nR, g, out float tM);
+				if (b * Mathf.Max(0.1f, PaceRateK) <= margin)
+				{
+					lo = mid;
+					bLo = b;
+					tLo = tM;
+				}
+				else
+				{
+					hi = mid;
+				}
+			}
+			revSimBetaDbg = bLo;
+			revSimTDbg = tLo;
+			return Mathf.Max(PaceRateFloor, lo);
+		}
+
+		// Revoker 0.4.0: the sweep cap fades in with the forecast sideslip over the margin (true); false = F-22E 2.6.6 (at every sideslip)
+		internal static bool SweepMarginGate = true;
+
+		private void CollectYawEffs()
+		{
+			yawEffs.Clear();
+			foreach (SurfaceEffector se in surfaces)
+			{
+				if (se.kind == SurfaceKind.Rudder && se.active && se.M != null && se.N >= 2 && se.rate > 0f)
+				{
+					yawEffs.Add(new YawEff { e = se, lo = se.min, hi = se.max, auth = Mathf.Max(0.05f, rudderAuth), rudder = true });
+				}
+			}
+			if (tvcy != null && tvcy.active && tvcy.M != null && tvcy.N >= 2 && tvcy.hi - tvcy.lo > 0.5f && tvcy.rate > 0f)
+			{
+				yawEffs.Add(new YawEff { e = tvcy, lo = tvcy.lo, hi = tvcy.hi, auth = 1f, rudder = false });
+			}
+		}
+
+		// the yaw moment (aero frame z) a yaw effector can reach each way within its usable travel
+		private static void YawRange(YawEff y, out float zHi, out float zLo)
+		{
+			zHi = float.MinValue;
+			zLo = float.MaxValue;
+			for (int i = 0; i < y.e.N; i++)
+			{
+				float g = y.e.grid[i];
+				if (g < y.lo - 0.001f || g > y.hi + 0.001f)
+				{
+					continue;
+				}
+				zHi = Mathf.Max(zHi, y.e.M[i].z);
+				zLo = Mathf.Min(zLo, y.e.M[i].z);
+			}
+			float zA = y.e.MAt(y.lo).z;
+			float zB = y.e.MAt(y.hi).z;
+			zHi = Mathf.Max(zHi, Mathf.Max(zA, zB));
+			zLo = Mathf.Min(zLo, Mathf.Min(zA, zB));
+		}
+
 		// Revoker 0.2.0: the inboard trailing-edge flaps as flaperons
 		public readonly List<HingeFlapEffector> hinges = new List<HingeFlapEffector>();
 
@@ -1048,6 +1981,24 @@ namespace Revoker_FS12.FCS
 		// inboard set's plus the canards' normal force from re-trimming both sets' pitch moment (canard normal force per unit
 		// of its pitch moment, from its own model at its present deflection). Scanned over 0..TeBrakeOutMax in 0.5 deg steps.
 		internal static float TeBrakeSymK = 50f;
+
+		// Revoker 0.2.10 (TrailingEdgeBrakeAoAFade): the in-flight set closes with AoA as the F-22E's speedbrake does. The F-22E
+		// opens it by drag share (AirbrakeAoAFade, 2.2.16: full at 40 % of the total drag, stowed at 15 %), which on the clean
+		// F-22E is full to ~15 deg AoA, half at ~25 and stowed past ~35. The same share rule does not carry over: the Revoker's
+		// elevon set is a smaller share of a cleaner airframe (bench, model drag, 400 km/h: 0.41 at 6 deg, 0.23 at 9, 0.13-0.17
+		// flat from 12 to 36 deg), so it would close by 12 deg and barely reopen (at most 9 % open up to 36 deg). The F-22E's resulting AoA schedule is used
+		// instead: full to TeFadeAoA0, closing linearly to stowed at TeFadeAoA1 (|AoA|), at most 2 /s as the F-22E's filter.
+		internal static float TeFadeAoA0 = 15f;
+
+		internal static float TeFadeAoA1 = 35f;
+
+		public float teFade = 1f;
+
+		private void TeBrakeFadeStep(float dt)
+		{
+			float tgt = 1f - Mathf.InverseLerp(TeFadeAoA0, Mathf.Max(TeFadeAoA0 + 1f, TeFadeAoA1), Mathf.Abs(alpha));
+			teFade = Mathf.MoveTowards(teFade, tgt, 2f * dt);
+		}
 
 		private void TeBrakeLiftBalance()
 		{
@@ -1577,11 +2528,33 @@ namespace Revoker_FS12.FCS
 
 		public float pitchNeed;
 
+		// 2.9.0: the two halves of pitchNeed - the nose-up run-away (1.8.23) and the capped nose-down sweep running ahead of its cap
+		public float pitchNeedUp;
+
+		public float pitchNeedDn;
+
+		public bool sweepHoldWinDbg;
+
 		// Revoker 0.2.5: 20 (F-22E / Ifrit: 5). Without TVC the modelled net nose-down at the 45 deg cap is under 10 deg/s^2,
 		// so the floor set the velocity-vector roll at 25 deg/s at every IAS (in-game 28 Oct 19:56, DisableTVC). Bench, TVC
 		// off, loaded rolls at the cap 220-600 km/h: 23-24 -> 32-46 deg/s mean, AoA overshoot 0.3 deg, sideslip 4.5-7.3 deg,
 		// push recovery unchanged (1.56 -> 1.66 s at 300 km/h). 30 gave little more (32-52) for more sideslip.
 		internal static float CoupRollFloor = 20f;
+
+		// 2.6.9: the coupling roll limit from the pitch axis's measured nose-down headroom (false = the table cap + gates)
+
+		// bench: split the blend's two effects (target mix with the rate cap / relaxation of the acceleration cap)
+		internal static float PaceBlendTargetK = 1f;
+
+		internal static float PaceBlendAccelK = 1f;
+
+		public float coupHeadDbg;
+
+		public float rcAOppDbg;
+
+		public float rcTcDbg;
+
+		public float rcSinHDbg;
 
 		public float coupRollLim;
 
@@ -1591,7 +2564,6 @@ namespace Revoker_FS12.FCS
 
 		internal static bool BranchFreeTvc = true;
 
-		internal static bool DebugBranch = false;
 
 		internal static bool BranchScaleToPeak = true;
 
@@ -1605,7 +2577,42 @@ namespace Revoker_FS12.FCS
 
 		internal static float LatTrimGain = 100f;
 
+		internal static bool LatReservePitchFrac = true;
+		public float latFloorDbg;
+		internal static bool ReleaseCoordinate = true;   // 2.18.0: released roll under a capped nose-down sweep, fins gone: target = r / sin AoA
+		internal static bool SweepHoldFade = true;       // 2.18.0: the nose waits above the rudder fade while excess yaw remains, fins gone
+		internal static float SweepHoldRate = 12f;       // 2.19.0: velocity-roll rotation (deg/s) above which the nose waits, fins gone
+		internal static float SweepHoldRateBlend = 6f;   // deg/s of blend above it
+		internal static float SweepHoldStabFrac = 0.25f; // the hold stands while stabPitchFrac is below this (stabs off pitch)
+		internal static bool PaceHoldPacedByRudder = true;   // 2.19.0: the window paces where the rudders are not the yaw axis (rudW < 1)
+		public float sweepHoldDbg;
+		public float pSStickRaw;
+		internal static bool PaceNoRetreat = true;   // 2.18.0: the latched window never moves the target back toward the rotation
+		internal static float PaceHoldCapFloor = 5f;   // deg/s^2
+
+
+		public float capSweepDbg, capShedDbg;   // 2.23.0: the two AoA-rate caps on the nose-down sweep this tick (deg/s; 60 = open) - which one binds
+		public float releaseBrakeTdDbg;   // 2.35.3: the device is deleted; the CSV column is kept (always 0)
+		public float sweepDelF;   // 2.24.0: the delivered wind-yaw deceleration the sweep cap credited (deg/s^2, low-passed)
+		public float stickRelW;   // 2.24.0: lateral stick released (1) .. held (0), over SweepNoReverseStick of stick travel
+		public float relFollowDbg;   // 2.35.3: the device is deleted; the CSV column is kept (always 0)
+		// 2.34.0 (PushGov): the lateral limit this tick (deg/s^2 of velocity-roll change allowed: < 0 the most the rotation may come down,
+		// > 0 what it must grow; NaN = not in force), the rotation side, the roll capacity read (3-tick, TradeCapTau)
+		public float pushGovL = float.NaN, pushGovU, pushGovA;
+		private float pushGovSide, pushGovCapXF, pushGovCapYF, pushGovP0, pushGovGrowF;
+		private bool pushGovXInit, pushGovActive;
+		public float pushGovCeil, pushGovP0Dbg, pushGovAMin;
+		private int reachLogPrev;
+		public bool pushPlanOn; public float pushPlanQ, pushPlanQNow, pushPlanBleed, pushPlanT, pushPlanSide, pushPlanD, pushHeldB;
+
+		public float aYawShedDbg;   // 2.22.0: the shed the cap paced to (deg/s^2)
+		internal static bool LatLimitYawFloor = true;   // 2.16.0: the lateral limit's coordination floor (see num11)
+		internal static float LatFloorSinMin = 0.26f;    // sin 15 deg
+
 		public float aUpPitch;
+
+		// Revoker 0.2.12: see PitchLaw (lateral reserve). false = 0.2.11.
+		internal static bool LatReserveTvcFull = true;
 
 		public float aDnPitch;
 
@@ -1695,6 +2702,12 @@ namespace Revoker_FS12.FCS
 				{
 					seH.host = hp;
 					seH.hostFoil = FoilFor(hp, aircraftParameters);
+					// Revoker 0.2.20: the camber increment on the host follows the elevon's own (staggered) curve
+					StallStagger.Fam fH = StallStagger.Enabled ? StallStagger.FamilyOf(seH.cs.gameObject.name) : StallStagger.Fam.None;
+					if (fH != StallStagger.Fam.None)
+					{
+						seH.hostFoil = StallStagger.TableForFamily(AirfoilOf(hp, aircraftParameters), fH);
+					}
 				}
 			}
 			foreach (SurfaceEffector surface in surfaces)
@@ -1874,7 +2887,18 @@ namespace Revoker_FS12.FCS
 					{
 						hostLN = null;
 					}
-					HingeFlapEffector hf = new HingeFlapEffector(apF, visF, hostF, hostLN, foils.TryGetValue(apF, out var tF) ? tF : FoilFor(apF, aircraftParameters), (hostF != null && foils.TryGetValue(hostF, out var tH)) ? tH : null, Plugin.FlapHingeRange, flaps.RestOf(visF), (hostLN != null) ? flaps.RestOf(hostLN) : null);
+					// Revoker 0.2.20: with ElevonStallStagger the camber share on wing2 uses the inboard elevon's curve (wing2's airfoil, remapped)
+					AirfoilTable hostTbl = (hostF != null && foils.TryGetValue(hostF, out var tH)) ? tH : null;
+					StallStagger.Fam fF = StallStagger.Enabled ? StallStagger.FamilyOf(apF.gameObject.name) : StallStagger.Fam.None;
+					if (hostF != null && fF != StallStagger.Fam.None)
+					{
+						hostTbl = StallStagger.TableForFamily(AirfoilOf(hostF, aircraftParameters), fF);
+					}
+					HingeFlapEffector hf = new HingeFlapEffector(apF, visF, hostF, hostLN, foils.TryGetValue(apF, out var tF) ? tF : FoilFor(apF, aircraftParameters), hostTbl, Plugin.FlapHingeRange, flaps.RestOf(visF), (hostLN != null) ? flaps.RestOf(hostLN) : null);
+					if (hostTbl != null && fF != StallStagger.Fam.None)
+					{
+						CamberForce.AddHinge(ac, hf, hostTbl);
+					}
 					hf.servo = (Plugin.SurfaceServoSpeed > 0f) ? Plugin.SurfaceServoSpeed : 70f;
 					hf.rollGroup = HingeRollGroup;
 					hinges.Add(hf);
@@ -1930,6 +2954,12 @@ namespace Revoker_FS12.FCS
 			return SurfaceKind.Other;
 		}
 
+		private static Airfoil AirfoilOf(AeroPart part, AircraftParameters prm)
+		{
+			int k = Acc.AP_airfoil(part);
+			return (k >= 0 && prm != null && prm.airfoils != null && k < prm.airfoils.Length) ? prm.airfoils[k] : null;
+		}
+
 		private static AirfoilTable FoilFor(AeroPart part, AircraftParameters prm)
 		{
 			Airfoil af = null;
@@ -1967,6 +2997,7 @@ namespace Revoker_FS12.FCS
 		{
 			float num = 0f;
 			Vector3 zero = Vector3.zero;
+			Vector3 vSum = Vector3.zero;
 			for (int num2 = bodies.Count - 1; num2 >= 0; num2--)
 			{
 				Rigidbody rigidbody = bodies[num2];
@@ -1978,6 +3009,7 @@ namespace Revoker_FS12.FCS
 				{
 					num += rigidbody.mass;
 					zero += rigidbody.mass * rigidbody.worldCenterOfMass;
+					vSum += rigidbody.mass * rigidbody.velocity;
 				}
 			}
 			if (num < 1f)
@@ -1986,6 +3018,7 @@ namespace Revoker_FS12.FCS
 			}
 			mass = num;
 			cg = zero / num;
+			vCg = vSum / num;
 			if (!full)
 			{
 				return;
@@ -2764,6 +3797,7 @@ namespace Revoker_FS12.FCS
 			}
 			engFixedPrev = fixedNow;
 			asymMNow = AsymMomentAt(alpha, rho, rootRot, ref ctx);
+			SlipProbeStep_(dt, rho, rootRot, ref ctx);
 			Vector3 vector = asymMF.Step(asymMNow, Mathf.Max(0.05f, Plugin.AsymFFWashout), dt);
 			float num = Mathf.Max(0.01f, Plugin.AsymDeadband);
 			float num2 = Mathf.Clamp01(Mathf.Max(Mathf.Abs(AccRoll(asymMNow)) / num, Mathf.Abs(AccYaw(asymMNow)) / (0.25f * num)) - 1f);
@@ -3148,6 +4182,392 @@ namespace Revoker_FS12.FCS
 			return (use < 0f) ? 0f : (1f - Mathf.Clamp01((use - 0.55f) / 0.3f));
 		}
 
+		// 2.5.15: the whole airframe's aero moment (aero frame: x roll, z yaw) at a hypothetical AoA + sideslip, the surfaces at
+		// their present deflection. Same per-part law as AsymMomentAt (the game's AeroJob_Math per AeroPart, the FCS's foil tables).
+		private Vector3 SlipMomentAt(float aDeg, float bDeg, float rho, Quaternion rootRot, ref EvalContext ctx)
+		{
+			return SlipMomentAt(aDeg, bDeg, rho, rootRot, ref ctx, 0f);
+		}
+
+		// Revoker 0.4.0: the same with a body yaw rate rYaw (rad/s, aero z): every part and surface sees its own velocity, v + omega x r,
+		// so the difference to rYaw = 0 is the airframe's yaw damping at this flow - what a nose-high fuselage does to a rotation by
+		// itself (the rate cap's reversal model had only the effectors braking it). rYaw = 0 is the 2.5.15 function exactly.
+		private Vector3 SlipMomentAt(float aDeg, float bDeg, float rho, Quaternion rootRot, ref EvalContext ctx, float rYaw)
+		{
+			float num = Mathf.Max(tas, 1f);
+			float fa = aDeg * (MathF.PI / 180f);
+			float fb = bDeg * (MathF.PI / 180f);
+			Vector3 vector = rootRot * new Vector3(Mathf.Sin(fb) * num, (0f - Mathf.Sin(fa)) * Mathf.Cos(fb) * num, Mathf.Cos(fa) * Mathf.Cos(fb) * num);
+			Vector3 omegaW = (rYaw != 0f) ? (rootRot * new Vector3(0f, rYaw, 0f)) : Vector3.zero;
+			Vector3 zero = Vector3.zero;
+			foreach (AeroPart aeroPart in aeroParts)
+			{
+				if (aeroPart == null || aeroPart.rb == null || aeroPart.IsDetached())
+				{
+					continue;
+				}
+				Transform transform = Acc.AP_liftNormal(aeroPart);
+				if (!(transform == null))
+				{
+					Quaternion rotation = transform.rotation;
+					Vector3 lhs = aeroPart.rb.worldCenterOfMass + rotation * Acc.AP_centerOfLift(aeroPart) - cg;
+					Vector3 vP = (rYaw != 0f) ? (vector + Vector3.Cross(omegaW, lhs)) : vector;
+					float vPm = Mathf.Max(vP.magnitude, 1f);
+					Vector3 rhs = -(vP / vPm) * (0.5f * (0.5f * rho * vPm * vPm) * Acc.AP_dragArea(aeroPart));
+					if (!surfaceParts.Contains(aeroPart) && foils.TryGetValue(aeroPart, out var value) && Acc.AP_wingArea(aeroPart) > 0f)
+					{
+						rhs += PartForce(vP, rotation, rotation * Vector3.right, value, 0.5f * rho * Acc.AP_wingArea(aeroPart) * Acc.AP_wingEff(aeroPart));
+					}
+					zero += Vector3.Cross(lhs, rhs);
+				}
+			}
+			Vector3 vector3 = Quaternion.Inverse(rootRot) * zero;
+			Vector3 result = new Vector3(0f - vector3.z, 0f - vector3.x, vector3.y);
+			for (int i = 0; i < surfaces.Count; i++)
+			{
+				if (surfaces[i].active)
+				{
+					Vector3 vS = vector;
+					if (rYaw != 0f && surfaces[i].part != null && surfaces[i].part.rb != null)
+					{
+						vS = vector + Vector3.Cross(omegaW, surfaces[i].part.rb.worldCenterOfMass - cg);
+					}
+					result += surfaces[i].EvalFlow(surfaces[i].now, vS, rho, ref ctx);
+				}
+			}
+			return result;
+		}
+
+		// 2.31.2: the whole airframe's aero moment (aero frame: x roll, z yaw) at a hypothetical CG air velocity vAir and body rotation
+		// w (world, rad/s), every aero part evaluated as the game's AeroJob_Math does it (the bench plant's Forces): the flow at the part
+		// vAir + w x arm, lift and drag from the part's table, the parasitic drag, the transonic factor, the stabs' downwash on the root
+		// body's flow, the per-part force clamp (30 x mass x |v|), and the flap-camber increment as CamberForce applies it. Control
+		// surfaces sit where their transforms are now; no thrust. SlipMomentAt (2.5.15) differs: uniform flow, surfaces through their
+		// effector model, no clamp - it over-reads the sideslip stiffness 2-15x above 40 deg AoA (claude/Passive_lateral_stiffness_finding.md).
+		private Vector3 AirframeMomentAt(Vector3 vAir, Vector3 w, float rho, Quaternion rootRot)
+		{
+			Vector3 vRootRef = vAir + Vector3.Cross(w, ac.rb.worldCenterOfMass - cg);
+			Vector3 m = Vector3.zero;
+			foreach (AeroPart ap in aeroParts)
+			{
+				if (ap == null || ap.rb == null || ap.IsDetached())
+				{
+					continue;
+				}
+				Transform lt = Acc.AP_liftNormal(ap);
+				if (lt == null)
+				{
+					continue;
+				}
+				Vector3 com = ap.rb.worldCenterOfMass;
+				Vector3 v = vAir + Vector3.Cross(w, com - cg);
+				float v2 = v.sqrMagnitude;
+				if (v2 < 1f)
+				{
+					continue;
+				}
+				float vmag = Mathf.Sqrt(v2);
+				Quaternion lr = lt.rotation;
+				Vector3 vf = Downwash.IsStabName(ap.name) ? Downwash.Apply(v, rootRot, vRootRef) : v;
+				Vector3 v6 = Quaternion.Inverse(lr) * vf;
+				float a = Mathf.Atan2(v6.y, v6.z);
+				float cl, cd;
+				if (foils.TryGetValue(ap, out var foil) && foil != null)
+				{
+					foil.Get(a, out cl, out cd);
+				}
+				else
+				{
+					cl = 1.8f * Mathf.Sin(5f * a);
+					cd = 1.5f * (1f - Mathf.Cos(2f * a)) + 0.02f;
+				}
+				float area = Acc.AP_wingArea(ap), eff = Acc.AP_wingEff(ap), dA = Acc.AP_dragArea(ap);
+				float n8 = (dA + area * 0.1f) * (1f - eff);
+				float n9 = 0.5f * rho * v2 * 0.5f * (dA + n8);
+				float n10 = cd * rho * v2 * 0.5f * area * eff;
+				float tr = DragReliefMath.Transonic(vmag / DragReliefMath.SpeedOfSound(com.y));
+				Vector3 vfHat = vf.normalized, vHat = v / vmag;
+				Vector3 f = (-vfHat * n10 - vHat * n9) * tr;
+				// the buffed profile's drag relief (DragRelief hook): part of the foil drag above its minimum, by part AoA and Mach
+				if (Plugin.DragReliefAoA > 0f || Plugin.DragReliefAoAHigh > 0f || Plugin.DragReliefTransonic > 0f)
+				{
+					if (!psCdMin.TryGetValue(ap, out float cdMin))
+					{
+						cdMin = float.MaxValue;
+						if (foil != null)
+						{
+							for (float aa = -0.35f; aa <= 0.35f; aa += 0.005f)
+							{
+								foil.Get(aa, out _, out var cdv);
+								cdMin = Mathf.Min(cdMin, cdv);
+							}
+						}
+						if (cdMin == float.MaxValue)
+						{
+							cdMin = 0f;
+						}
+						psCdMin[ap] = cdMin;
+					}
+					float dRel = DragReliefMath.Relief(n9, n10, Mathf.Min(cdMin, cd) * rho * v2 * 0.5f * area * eff, vmag / DragReliefMath.SpeedOfSound(com.y), a * 57.29578f);
+					if (dRel > 0f)
+					{
+						f += vHat * dRel;
+					}
+				}
+				Vector3 nrm = Vector3.Cross(vf, lr * Vector3.right);
+				float nm = nrm.magnitude;
+				if (nm > 0.0001f)
+				{
+					f += -nrm / nm * (cl * rho * v2 * 0.5f * area * eff);
+				}
+				f = Vector3.ClampMagnitude(f, vmag * 0.5f * ap.mass * 60f);
+				m += Vector3.Cross(com + lr * Acc.AP_centerOfLift(ap) - cg, f);
+			}
+			// flap-camber coupling, as CamberForce: the host's force increment for its surface's present deflection, unclamped
+			if (psCamber == null)
+			{
+				psCamber = new List<(ControlSurface, AeroPart, AirfoilTable)>();
+				AircraftParameters prm = ac.GetAircraftParameters();
+				Dictionary<string, AeroPart> byName = new Dictionary<string, AeroPart>();
+				foreach (AeroPart ap in aeroParts)
+				{
+					if (ap != null)
+					{
+						byName[ap.gameObject.name.Replace("Aryx_KingRaptor_", "")] = ap;
+					}
+				}
+				foreach (ControlSurface cs in Acc.Collect<ControlSurface>(ac))
+				{
+					string hn = Camber.HostOf(cs.gameObject.name);
+					if (hn == null || !byName.TryGetValue(hn, out var host))
+					{
+						continue;
+					}
+					int idx = Acc.AP_airfoil(host);
+					Airfoil af = (idx >= 0 && prm != null && prm.airfoils != null && idx < prm.airfoils.Length) ? prm.airfoils[idx] : null;
+					if (af == null || af.liftCoef == null || af.dragCoef == null || Acc.CS_visible(cs) == null)
+					{
+						continue;
+					}
+					psCamber.Add((cs, host, StallStagger.TableFor(host, af)));
+				}
+			}
+			foreach (var (cs, host, table) in psCamber)
+			{
+				if (cs == null || host == null || host.rb == null || host.IsDetached() || !Acc.JobCreated(cs))
+				{
+					continue;
+				}
+				ref NuclearOption.Jobs.ControlSurfaceFields job = ref Acc.Job(cs);
+				if (job.IsDetached)
+				{
+					continue;
+				}
+				float k = Camber.KForName(cs.gameObject.name);
+				Transform lt = Acc.AP_liftNormal(host);
+				if (k <= 0f || lt == null)
+				{
+					continue;
+				}
+				Transform vis = Acc.CS_visible(cs).transform;
+				float delta = Camber.DeflectionOf(vis, job.restingRotation);
+				Vector3 com = host.rb.worldCenterOfMass;
+				Vector3 v = vAir + Vector3.Cross(w, com - cg);
+				float v2 = v.sqrMagnitude;
+				if (v2 < 25f)
+				{
+					continue;
+				}
+				float qS = 0.5f * rho * v2 * Acc.AP_wingArea(host) * Acc.AP_wingEff(host);
+				Vector3 dF = Camber.Delta(v, lt.rotation, vis.rotation * Vector3.right, k, delta, table, qS);
+				m += Vector3.Cross(com + lt.rotation * Acc.AP_centerOfLift(host) - cg, dF);
+			}
+			Vector3 mb = Quaternion.Inverse(rootRot) * m;
+			return new Vector3(0f - mb.z, 0f - mb.x, mb.y);
+		}
+
+		// 2.31.2: the passive airframe telemetry (see the psA / psD / cePass fields). Body rates in the aero frame (x roll, z yaw),
+		// world rotation w = rootRot * (-qa.y, qa.z, -qa.x) for aero rates qa = (p, q, r) - the inverse of the omega mapping in Tick.
+		private void PassiveStep(float dt, float rho, Quaternion rootRot)
+		{
+			if (!PassiveProbeOn || isAI || tas < 30f)
+			{
+				return;
+			}
+			Vector3 vAir = vCgAir;
+			Vector3 W(float pa, float qa, float ra)
+			{
+				return rootRot * new Vector3(0f - qa, ra, 0f - pa);
+			}
+			float pNow = omega.x, qNow = omega.y, rNow = omega.z;   // rad/s
+			Vector3 m0 = AirframeMomentAt(vAir, W(pNow, qNow, rNow), rho, rootRot);
+			psAX = AccRoll(m0);
+			psAZ = AccYaw(m0);
+			Vector3 m1 = AirframeMomentAt(vAir, W(pCmd * (MathF.PI / 180f), qNow, rCmd * (MathF.PI / 180f)), rho, rootRot);
+			psDX = AccRoll(m1) - psAX;
+			psDZ = AccYaw(m1) - psAZ;
+			cePassXP = Mathf.Max(0f, psDX);
+			cePassXN = Mathf.Max(0f, 0f - psDX);
+			cePassZP = Mathf.Max(0f, psDZ);
+			cePassZN = Mathf.Max(0f, 0f - psDZ);
+			float ar = alpha * (MathF.PI / 180f);
+			float dS = psDX * Mathf.Cos(ar) + psDZ * Mathf.Sin(ar);   // along the velocity-roll axis (body roll : yaw = cos a : sin a)
+			cePassSP = Mathf.Max(0f, dS);
+			cePassSN = Mathf.Max(0f, 0f - dS);
+			psDerivTimer += dt;
+			if (psDerivTimer < PassiveDerivPeriod)
+			{
+				return;
+			}
+			psDerivTimer = 0f;
+			// sideslip: the CG flow at (alpha, beta +- db), same TAS (the parametrization of SlipMomentAt and the bench), the rates held
+			const float db = 2f, dw = 5f;
+			Vector3 VAt(float bDeg)
+			{
+				float fa = alpha * (MathF.PI / 180f), fb = bDeg * (MathF.PI / 180f);
+				return rootRot * new Vector3(Mathf.Sin(fb), (0f - Mathf.Sin(fa)) * Mathf.Cos(fb), Mathf.Cos(fa) * Mathf.Cos(fb)) * tas;
+			}
+			Vector3 wNow = W(pNow, qNow, rNow);
+			Vector3 mbP = AirframeMomentAt(VAt(beta + db), wNow, rho, rootRot);
+			Vector3 mbN = AirframeMomentAt(VAt(beta - db), wNow, rho, rootRot);
+			psLb = (AccRoll(mbP) - AccRoll(mbN)) / (2f * db);
+			psNb = (AccYaw(mbP) - AccYaw(mbN)) / (2f * db);
+			float dwr = dw * (MathF.PI / 180f);
+			Vector3 mpP = AirframeMomentAt(vAir, W(pNow + dwr, qNow, rNow), rho, rootRot);
+			Vector3 mpN = AirframeMomentAt(vAir, W(pNow - dwr, qNow, rNow), rho, rootRot);
+			psLp = (AccRoll(mpP) - AccRoll(mpN)) / (2f * dw);
+			psNp = (AccYaw(mpP) - AccYaw(mpN)) / (2f * dw);
+			Vector3 mrP = AirframeMomentAt(vAir, W(pNow, qNow, rNow + dwr), rho, rootRot);
+			Vector3 mrN = AirframeMomentAt(vAir, W(pNow, qNow, rNow - dwr), rho, rootRot);
+			psLr = (AccRoll(mrP) - AccRoll(mrN)) / (2f * dw);
+			psNr = (AccYaw(mrP) - AccYaw(mrN)) / (2f * dw);
+		}
+
+		// the rudders' one-side yaw and the other surfaces' roll authority at a hypothetical flow (deg/s^2)
+		private void SlipAuthorityAt(float aDeg, float bDeg, float rho, Quaternion rootRot, ref EvalContext ctx, out float yawA, out float rollA)
+		{
+			float num = Mathf.Max(tas, 1f);
+			float fa = aDeg * (MathF.PI / 180f);
+			float fb = bDeg * (MathF.PI / 180f);
+			Vector3 vector = rootRot * new Vector3(Mathf.Sin(fb) * num, (0f - Mathf.Sin(fa)) * Mathf.Cos(fb) * num, Mathf.Cos(fa) * Mathf.Cos(fb) * num);
+			yawA = 0f;
+			rollA = 0f;
+			for (int i = 0; i < surfaces.Count; i++)
+			{
+				SurfaceEffector se = surfaces[i];
+				if (!se.active)
+				{
+					continue;
+				}
+				Vector3 mMax = se.EvalFlow(se.max, vector, rho, ref ctx);
+				Vector3 mMin = se.EvalFlow(se.min, vector, rho, ref ctx);
+				if (se.kind == SurfaceKind.Rudder)
+				{
+					yawA += 0.5f * Mathf.Abs(mMax.z - mMin.z) * IaInv[2, 2] * 57.29578f * Mathf.Max(0.05f, rudderAuth);
+				}
+				else
+				{
+					rollA += 0.5f * Mathf.Abs(mMax.x - mMin.x) * IaInv[0, 0] * 57.29578f;
+				}
+			}
+			// Revoker 0.3.0: the yaw nozzle is part of the yaw axis at every sideslip (thrust; its table does not move with the flow)
+			if (tvcy != null && tvcy.active && tvcy.M != null && tvcy.N >= 2 && tvcy.hi - tvcy.lo > 0.5f)
+			{
+				float zA = tvcy.MAt(tvcy.lo).z;
+				float zB = tvcy.MAt(tvcy.hi).z;
+				yawA += 0.5f * Mathf.Abs(zB - zA) * IaInv[2, 2] * 57.29578f;
+			}
+		}
+
+		private void SlipProbeStep_(float dt, float rho, Quaternion rootRot, ref EvalContext ctx)
+		{
+			if (!Plugin.RollStopSlipProbe || isAI)
+			{
+				slipTolF = 25f;
+				slipTolDbg = 25f;
+				return;
+			}
+			slipProbeTimer += dt;
+			if (slipProbeTimer >= SlipProbePeriod && tas > 30f)
+			{
+				slipProbeTimer = 0f;
+				// the sign of a restoring yaw moment, latched once at low AoA where any conventional airframe is directionally
+				// stable (the probe's sweep gives it: the yaw moment grows with the sideslip one way or the other)
+				if (slipSignR == 0f && Mathf.Abs(alpha) < 10f && tas > 60f)
+				{
+					float n0 = AccYaw(SlipMomentAt(alpha, 0f, rho, rootRot, ref ctx));
+					float nP = AccYaw(SlipMomentAt(alpha, 8f, rho, rootRot, ref ctx));
+					float nN = AccYaw(SlipMomentAt(alpha, -8f, rho, rootRot, ref ctx));
+					float dP = nP - n0;
+					float dN = n0 - nN;
+					slipSignR = ((dP + dN) >= 0f) ? 1f : (-1f);
+				}
+				if (slipSignR == 0f)
+				{
+					slipTolDbg = 25f;
+				}
+				else
+				{
+					float dep = SlipProbeMax + 5f;
+					float auth = SlipProbeMax + 5f;
+					float stiff = 0f;
+					float n0 = AccYaw(SlipMomentAt(alpha, 0f, rho, rootRot, ref ctx));
+					SlipAuthorityAt(alpha, 0f, rho, rootRot, ref ctx, out float y0, out float r0);
+					for (int sgn = -1; sgn <= 1; sgn += 2)
+					{
+						for (float b = SlipProbeStep; b <= SlipProbeMax + 0.01f; b += SlipProbeStep)
+						{
+							float bb = sgn * b;
+							// restoring yaw at this sideslip (deg/s^2; positive = toward zero sideslip)
+							float rest = (AccYaw(SlipMomentAt(alpha, bb, rho, rootRot, ref ctx)) - n0) * slipSignR * sgn;
+							if (b <= SlipProbeStep + 0.01f)
+							{
+								stiff += 0.5f * rest / SlipProbeStep;
+							}
+							SlipAuthorityAt(alpha, bb, rho, rootRot, ref ctx, out float yB, out float rB);
+							// departure: the airframe pushes the sideslip open harder than SlipAuthUse of the yaw axis can pull back - the
+							// rudders' yaw at that sideslip, or past the rudder fade the allocator's yaw authority (the stabs'): 2.5.16,
+							// the 14:55 log read a 4 deg bound at -20..-60 deg AoA where the rudders' tables are faded to nothing
+							// and any destabilizing moment at all tripped the test (the margin never moved, the episodes were short)
+							// Revoker 0.3.0: the yaw axis at this sideslip is the rudder (faded) + the nozzle, as SlipAuthorityAt sums them;
+							// no allocator-wide credit (see yawEffs)
+							float yHold = yB;
+							if (rest < 0f - SlipAuthUse * yHold && b < dep)
+							{
+								dep = b;
+							}
+							// authority: the rudders' yaw or the surfaces' roll down to SlipAuthFrac of their zero-sideslip value
+							if ((yB < SlipAuthFrac * y0 || rB < SlipAuthFrac * r0) && b < auth)
+							{
+								auth = b;
+							}
+							if (dep <= b && auth <= b)
+							{
+								break;
+							}
+						}
+					}
+					slipDepDbg = dep;
+					slipAuthDbg = auth;
+					slipStiffDbg = stiff;
+					slipTolDbg = Mathf.Min(dep, auth);
+					// Revoker 0.4.0: the airframe's yaw damping at the present AoA and sideslip, deg/s^2 per deg/s of body yaw rate (negative = damping)
+					float nR0 = AccYaw(SlipMomentAt(alpha, beta, rho, rootRot, ref ctx, 0f));
+					float nR1 = AccYaw(SlipMomentAt(alpha, beta, rho, rootRot, ref ctx, SlipDampProbeRate));
+					slipDampDbg = (nR1 - nR0) / (SlipDampProbeRate * 57.29578f);
+					// Revoker 0.4.0: the signed sideslip slopes for the reversal model (tables' own sign; the kinematics decide what restores)
+					Vector3 mP = SlipMomentAt(alpha, SlipProbeStep, rho, rootRot, ref ctx);
+					Vector3 mN = SlipMomentAt(alpha, 0f - SlipProbeStep, rho, rootRot, ref ctx);
+					slipYawSlopeDbg = (AccYaw(mP) - AccYaw(mN)) / (2f * SlipProbeStep);
+					slipRollSlopeDbg = (AccRoll(mP) - AccRoll(mN)) / (2f * SlipProbeStep);
+				}
+			}
+			slipTolF += (slipTolDbg - slipTolF) * (dt / (SlipTolTau + dt));
+			slipDampF += (slipDampDbg - slipDampF) * (dt / (SlipTolTau + dt));
+			slipYawSlopeF += (slipYawSlopeDbg - slipYawSlopeF) * (dt / (SlipTolTau + dt));
+			slipRollSlopeF += (slipRollSlopeDbg - slipRollSlopeF) * (dt / (SlipTolTau + dt));
+		}
+
 		private void AsymSweepPrep(Quaternion rootRot)
 		{
 			asymSweepIas = Mathf.Max(ias, 1f);
@@ -3250,7 +4670,7 @@ namespace Revoker_FS12.FCS
 				float pRud0 = 0f;
 				float pRudP = 0f;
 				float pRudM = 0f;
-				float toe = (AuthCapRudderToe && Plugin.RudderPitchAid) ? Plugin.RudderToeMax : 0f;
+				float toe = 0f;
 				float num3 = 0f;
 				float num4 = 0f;
 				float t = Mathf.InverseLerp(30f, 45f, Mathf.Abs(asymAlphas[i]));
@@ -3445,7 +4865,7 @@ namespace Revoker_FS12.FCS
 				}
 			}
 			Quaternion rootInv = Quaternion.Inverse(((Component)(object)ac).transform.rotation);
-			vCgAir = ac.rb.velocity - wind;
+			vCgAir = ((AirDataAtCg && vCg.sqrMagnitude > 0f) ? vCg : ac.rb.velocity) - wind;
 			float q0 = omega.y;
 			float mP = NonSurfacePitch(wind, rho, rootInv, rootRight, 1f, q0);
 			float mM = NonSurfacePitch(wind, rho, rootInv, rootRight, -1f, q0);
@@ -3466,7 +4886,7 @@ namespace Revoker_FS12.FCS
 			float num = 0f;
 			float num2 = 0f;
 			float num3 = mass * 9.81f;
-			Vector3 vCgHat = (ac.rb.velocity - wind).normalized;
+			Vector3 vCgHat = (((AirDataAtCg && vCg.sqrMagnitude > 0f) ? vCg : ac.rb.velocity) - wind).normalized;
 			float dragAf = 0f;
 			foreach (AeroPart aeroPart in aeroParts)
 			{
@@ -3656,25 +5076,42 @@ namespace Revoker_FS12.FCS
 			}
 			UpdateMassProps(flag || !havePrev, quaternion);
 			Vector3 vector = Acc.AC_wind(ac);
-			Vector3 vector2 = rb.velocity - vector;
+			Vector3 vRef = (AirDataAtCg && vCg.sqrMagnitude > 0f) ? vCg : rb.velocity;
+			Vector3 vector2 = vRef - vector;
 			tas = vector2.magnitude;
 			float num2 = Mathf.Max(0.01f, ac.airDensity);
 			ias = tas * Mathf.Sqrt(num2 / 1.225f);
 			Vector3 vector3 = quaternion * vector2;
 			alpha = ((tas > 1f) ? (Mathf.Atan2(0f - vector3.y, vector3.z) * 57.29578f) : 0f);
 			beta = ((tas > 1f) ? (Mathf.Asin(Mathf.Clamp(vector3.x / tas, -1f, 1f)) * 57.29578f) : 0f);
+			{
+				Vector3 vRootB = quaternion * (rb.velocity - vector);
+				float tasR = vRootB.magnitude;
+				alphaRoot = (tasR > 1f) ? (Mathf.Atan2(0f - vRootB.y, vRootB.z) * 57.29578f) : 0f;
+				betaRoot = (tasR > 1f) ? (Mathf.Asin(Mathf.Clamp(vRootB.x / tasR, -1f, 1f)) * 57.29578f) : 0f;
+				Vector3 vCgB = quaternion * (((vCg.sqrMagnitude > 0f) ? vCg : rb.velocity) - vector);
+				float tasC = vCgB.magnitude;
+				alphaCgDbg = (tasC > 1f) ? (Mathf.Atan2(0f - vCgB.y, vCgB.z) * 57.29578f) : 0f;
+				betaCgDbg = (tasC > 1f) ? (Mathf.Asin(Mathf.Clamp(vCgB.x / tasC, -1f, 1f)) * 57.29578f) : 0f;
+			}
 			Vector3 vector4 = quaternion * rb.angularVelocity;
 			omega = new Vector3(0f - vector4.z, 0f - vector4.x, vector4.y);
 			Vector3 x = (havePrev ? ((rb.velocity - velPrev) / num) : Vector3.zero);
 			Vector3 vector5 = accF.Step(x, 0.05f, num);
+			Vector3 xCg = (havePrev ? ((vRef - vCgPrev) / num) : Vector3.zero);
+			Vector3 accCg = accCgF.Step(xCg, 0.05f, num);
+			if (!FlightPathAtCg)
+			{
+				accCg = vector5;
+			}
 			Vector3 lhs = vector5 - Physics.gravity;
 			nz = Vector3.Dot(lhs, transform.up) / 9.81f;
 			nxDbg = Vector3.Dot(lhs, transform.forward) / 9.81f;   // 0.4.6 telemetry: body-axis specific force along the nose (g)
 			Vector3 vector6 = ((tas > 1f) ? Vector3.Cross(vector2, transform.right).normalized : transform.up);
 			eLy = vector6.y;
 			float vc = Mathf.Max(tas, 30f);
-			omegaV = Vector3.Dot(vector5, vector6) / Mathf.Max(tas, 5f) * 57.29578f;
-			vDot = vDotF.Step((tas > 1f) ? Vector3.Dot(vector5, vector2 / tas) : 0f, 0.2f, num);
+			omegaV = Vector3.Dot(accCg, vector6) / Mathf.Max(tas, 5f) * 57.29578f;
+			vDot = vDotF.Step((tas > 1f) ? Vector3.Dot(accCg, vector2 / tas) : 0f, 0.2f, num);
 			theta = Mathf.Asin(Mathf.Clamp(transform.forward.y, -1f, 1f)) * 57.29578f;
 			phi = Mathf.Atan2(0f - transform.right.y, transform.up.y) * 57.29578f;
 			float x2 = (havePrev ? (Mathf.DeltaAngle(alphaPrev, alpha) / num) : 0f);
@@ -3713,7 +5150,7 @@ namespace Revoker_FS12.FCS
 			// drawn to the F-22E's speedbrake set: inboard trailing edge down (its flaperons), outboard up (its ailerons). Their
 			// lift and pitch largely cancel (the canards trim what is left); the differentials stay free for roll. Scaled by the
 			// airbrake's AoA fade, off on the wheels (the rollout aero-brake takes over there).
-			teBrakeAir = (TeBrakeOn && !flag2 && Mode != FcsMode.Ground && Mode != FcsMode.Off) ? (airBrake * (Plugin.AirbrakeAoAFade ? airbrakeFade : 1f)) : 0f;
+			teBrakeAir = (TeBrakeOn && !flag2 && Mode != FcsMode.Ground && Mode != FcsMode.Off) ? (airBrake * (Plugin.TeBrakeAoAFade ? teFade : 1f)) : 0f;
 			// Revoker 0.2.9: as fast as the actuators move it (the inboard elevons' full set at their servo rate; 0.2.8: 0.5 /s)
 			float teRate = (TeBrakeAirRate > 0f) ? TeBrakeAirRate : (((hinges.Count > 0) ? Mathf.Max(1f, hinges[0].servo) : 70f) / Mathf.Max(1f, Mathf.Max(Plugin.AirBrakeInboardDown, TeBrakeOutMax)));
 			teBrakeAirF = Mathf.MoveTowards(teBrakeAirF, teBrakeAir, teRate * num);
@@ -3812,6 +5249,7 @@ namespace Revoker_FS12.FCS
 					}
 				}
 			}
+			TeBrakeFadeStep(num);
 			TeBrakeLiftBalance();
 			// Ifrit 0.2.2: airbrake. The game holds the splits at full travel while the brake is out (SurfacePostfix feeds the job
 			// zero throttle); 0.2.1 modelled them as still under the allocator's control, so each frame it 'retracted' splits
@@ -3901,15 +5339,21 @@ namespace Revoker_FS12.FCS
 			distLeadAcc = distLeadGate * Mathf.Clamp(dDotYF * Plugin.HybridIndiHighAoALead, -DistLeadMax * (MathF.PI / 180f), DistLeadMax * (MathF.PI / 180f));
 			omegaPrev = omega;
 			velPrev = rb.velocity;
+			vCgPrev = (AirDataAtCg && vCg.sqrMagnitude > 0f) ? vCg : rb.velocity;
 			havePrev = true;
 			float num4 = 0f;
 			float num5 = 0f;
 			Vector3 zero2 = Vector3.zero;
 			Vector3 zero3 = Vector3.zero;
+			float zNowAll = 0f;
 			foreach (Effector eff2 in effs)
 			{
 				if (eff2.active)
 				{
+					if (eff2.M != null && eff2.N >= 2)
+					{
+						zNowAll += eff2.MAt(eff2.now).z;
+					}
 					Vector3 vector9 = new Vector3(float.MinValue, float.MinValue, float.MinValue);
 					Vector3 vector10 = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
 					for (int i = 0; i < eff2.N; i++)
@@ -3977,6 +5421,10 @@ namespace Revoker_FS12.FCS
 			rollCtrlHalf = aRoll * (MathF.PI / 180f) / Mathf.Max(IaInv[0, 0], 1E-09f);
 			aRollWing = Mathf.Clamp(aRollWF.Step(num8 * IaInv[0, 0] * 57.29578f, 0.2f, num), 10f, 5000f);
 			aYaw = Mathf.Clamp(aYawF.Step(0.5f * (zero2.z - zero3.z) * IaInv[2, 2] * 57.29578f, 0.2f, num), 5f, 3000f);
+			// 2.6.9: how much of the airframe's yaw range all the effectors together are using now (0 = centred, 1 = at the stops):
+			// the same effectors and tables as aYaw, read from where they are - whatever carries the yaw at this AoA
+			float yawUseRaw = Mathf.Abs(zNowAll - 0.5f * (zero2.z + zero3.z)) / Mathf.Max(1E-06f, 0.5f * (zero2.z - zero3.z));
+			yawUseAllF += (Mathf.Clamp01(yawUseRaw) - yawUseAllF) * (num / (0.05f + num));
 			float t = Mathf.Clamp01((Mathf.Abs(alpha) - 20f) / 20f);
 			float num12 = ((!flightAssist) ? Plugin.MpoGPos : Plugin.GPos);
 			float num13 = ((!flightAssist) ? Plugin.MpoGNeg : Plugin.GNeg);
@@ -3991,6 +5439,8 @@ namespace Revoker_FS12.FCS
 			}
 			float t3 = 1f - stabPitchFrac;
 			pitchNeed = 0f;
+			pitchNeedUp = 0f;
+			pitchNeedDn = 0f;
 			if (Plugin.OvershootPitchPriority && Engaged && Mode != FcsMode.Ground && Mode != FcsMode.Off)
 			{
 				float num47 = Mathf.Sign(alpha) * (omega.y * 57.29578f - qT);
@@ -4007,13 +5457,33 @@ namespace Revoker_FS12.FCS
 				{
 					pitchNeed = 1f;
 				}
+				pitchNeedUp = pitchNeed;
+				// 2.9.0: the capped sweep toward zero AoA (last tick's cap state; the cap runs later in the tick). Only while the cap
+				// clipped the command on the toward-zero side (positive AoA: the stick asked for more nose-down than the cap gave,
+				// yawSatPitchDbg < 0; negative AoA: more nose-up, > 0) and the nose is moving toward zero faster than the capped
+				// command. Not into the coupling roll gate (gateC reads pitchNeedUp): the rotation is not cut, the stabs are taken
+				// back for the hold. (Bench: gated on the raw sign it also fired on a push to -20 deg AoA under a roll, where the cap
+				// clipped the sweep that grows |AoA| and the pitch merely lagged it: pitch weight 8 -> 16 for 0.2 s, 1.3 deg more
+				// sideslip in the pull-through after.)
+				pitchNeedDn = 0f;
+				if (sweepClipOn && Mathf.Sign(alpha) * sweepClipDbg < -1f)
+				{
+					float dnOver = Mathf.Sign(alpha) * (qT - omega.y * 57.29578f);
+					pitchNeedDn = Mathf.Clamp01((dnOver - SweepHoldErr0) / Mathf.Max(0.5f, SweepHoldErrSpan)) * Mathf.Clamp01((Mathf.Abs(alpha) - 15f) / 10f);
+				}
+				pitchNeed = Mathf.Max(pitchNeed, pitchNeedDn);
 				t3 *= 1f - pitchNeed;
 			}
 			// Revoker 0.2.7 (HighAoARollWeight): with the nozzles not covering pitch (TVC off / low thrust) the surfaces carry
 			// every axis and the 0.35 high-AoA roll weight let pitch and yaw take the roll away under saturation; with the nozzles
 			// working the F-22E's 0.35 stays (bench: 1 there loosened the damaged-jet reversal, roll error x3). Faded at 1/s.
 			hiRollWF = Mathf.MoveTowards(hiRollWF, noTvcOn ? 1f : 0f, num);
-			alloc.axisWeight = new Vector3(Mathf.Lerp(Mathf.Lerp(1f, Mathf.Lerp(0.35f, Plugin.HighAoARollWeight, hiRollWF), t), 1.5f, t3), Mathf.Lerp(Mathf.Lerp(8f, 15f, t2), 1f, t3), Mathf.Lerp(Mathf.Lerp(Plugin.YawPriority, (YawPrioHi > 0f && Plugin.SlipYawWeightOn) ? Mathf.Lerp(Mathf.Max(2f, Plugin.YawPriority), Mathf.Min(Plugin.YawPriority, YawPrioHi), YawHiSlipGate()) : Mathf.Max(2f, Plugin.YawPriority), t), Mathf.Max(2.5f, Plugin.YawPriority), t3));
+			// Revoker 0.4.0: the allocator's lateral residual in the velocity frame (see Allocator.slipFrame). The AoA is the measured
+			// one; on the ground, with the stick in the ground modes and in MPO (separate axes) the body frame stands.
+			alloc.slipFrame = SlipFrameAlloc && Engaged && Mode != FcsMode.Ground && Mode != FcsMode.Off;
+			alloc.slipSin = Mathf.Sin(alpha * (MathF.PI / 180f));
+			alloc.slipCos = Mathf.Cos(alpha * (MathF.PI / 180f));
+			alloc.axisWeight = new Vector3(Mathf.Lerp(alloc.slipFrame ? 1f : Mathf.Lerp(1f, Mathf.Lerp(0.35f, Plugin.HighAoARollWeight, hiRollWF), t), 1.5f, t3), Mathf.Lerp(Mathf.Lerp(8f, 15f, t2), 1f, t3), Mathf.Lerp(Mathf.Lerp(Plugin.YawPriority, (YawPrioHi > 0f && Plugin.SlipYawWeightOn) ? Mathf.Lerp(Mathf.Max(2f, Plugin.YawPriority), Mathf.Min(Plugin.YawPriority, YawPrioHi), YawHiSlipGate()) : Mathf.Max(2f, Plugin.YawPriority), t), Mathf.Max(2.5f, Plugin.YawPriority), t3));
 			alloc.PairedTrimSearch = PairedTrim && Plugin.StabTvcPairedSearch;
 			// 2.0.6 rudder pitch aid: the symmetric rudder split is cheap only while no roll or yaw is asked for (stick,
 			// pedal, or a roll still running); with lateral input the rudders go back to yaw, as the stabs do.
@@ -4122,7 +5592,16 @@ namespace Revoker_FS12.FCS
 				{
 					surface4.antiCost = Mathf.Lerp(0.0002f, Mathf.Lerp(Plugin.StabRollCost, 0.01f, Mathf.InverseLerp(160f, 240f, ias)), stabPitchFrac);
 					surface4.antiCost = Mathf.Lerp(surface4.antiCost, Mathf.Max(surface4.antiCost, AsymStabAntiCost), pitchNeed * Mathf.Clamp01((Mathf.Abs(asymDy) - CoupHeldDy0) / CoupHeldDySpan));
-					surface4.symCost = Plugin.StabTrimCost * (1f + LatTrimGain * latReserve);
+					// 2.15.0: the lateral reserve prices the stabs' pitch use only where they have pitch use (stabPitchFrac). Past their
+					// pitch stall (65 deg AoA, stabPitchFrac 0) the symmetric movement the allocator needs for yaw and roll is not pitch
+					// trim, and x 71 on it held the stabs still for 0.5 s at a no-fin reversal while the yaw loop was 60 deg/s^2 short
+					// (19:54 log, 164.8 s: symCost 0 -> 0.28 at the stick, stabs parked until the roll target fell away).
+					// 2.15.0: the lateral reserve keeps symmetric stab travel for anti-symmetric use. Where the estimator counts the
+					// stabs' SYMMETRIC motion as the yaw capacity (rudW -> 0: fins gone or rudders faded) that reserve starves the
+					// yaw it is meant to serve (19:54 log, 164.8 s: stabs parked 0.5 s on symCost 0.28), so it goes with the pitch
+					// range the stabs still have. With the rudders present it is unchanged.
+					float rudWsym = Mathf.Clamp01(rudderAuth) * Mathf.Clamp01(yawHealth / 0.5f);
+					surface4.symCost = Plugin.StabTrimCost * (1f + LatTrimGain * latReserve * (LatReservePitchFrac ? Mathf.Lerp(stabPitchFrac, 1f, rudWsym) : 1f));
 					// 2.2.14 test: extra cost on the stab split at high AoA (roll moved to the rudders / flaperons / sideslip)
 					if (HiAoAStabRollCost > 0f)
 					{
@@ -4143,7 +5622,8 @@ namespace Revoker_FS12.FCS
 			{
 				float relLat = 1f - Mathf.Max(Mathf.Clamp01((Mathf.Abs(sr) - 0.03f) / 0.12f), Mathf.Clamp01((Mathf.Abs(sy) - 0.03f) / 0.12f));
 				float pErr = Mathf.Abs(omega.x * 57.29578f - pCmd);
-				float rlp = Mathf.Lerp(1f, RelLatRollPrio, relLat * Mathf.Clamp01((pErr - 2f) / 8f));
+				// 2.9.0: not while the capped sweep's pitch hold has the stabs (pitchNeedDn)
+				float rlp = Mathf.Lerp(1f, RelLatRollPrio, relLat * Mathf.Clamp01((pErr - 2f) / 8f) * (1f - pitchNeedDn));
 				relLatPrioDbg = rlp;
 				if (rlp > 1.001f)
 				{
@@ -4157,28 +5637,54 @@ namespace Revoker_FS12.FCS
 			{
 				alloc.axisWeight = new Vector3(alloc.axisWeight.x, alloc.axisWeight.y * pitchPrio, alloc.axisWeight.z);
 			}
-			float relRb = relStick * stabPitchFrac;
 			// Revoker 0.2.8: not while the TrailingEdgeBrakeConfig set moves in or out: the elevons' common deflection needs the
 			// canards to re-trim with it, and bounded to their own (near-zero) rate they held both still for 0.7 s mid-way and
 			// let go in one step (bench, 400 km/h: elevons 11 -> 18 deg in 0.2 s, nz 1.07 -> 0.81)
 			bool teBrakeMoving = Mathf.Abs(teBrakeAir - teBrakeAirF) > 0.001f || (teBrakeLandF > 0.001f && teBrakeLandF < 0.999f);
 			teBrakeMov = teBrakeMoving;
-			stabRateBound = Engaged && Mode != FcsMode.Ground && Mode != FcsMode.Off && Plugin.ReleasedStabRateBound > 0f && relRb > 0.01f && !teBrakeMoving;
-			if (stabRateBound)
+			// 2.4.6 telemetry: the allocator's axis weights after the priority terms (roll, pitch, yaw)
+			axWDbg = alloc.axisWeight;
+			// 2.9.1: also while the capped sweep's pitch hold has the stabs (pitchNeedDn). 16:29 log (2.9.0), 75.0 s: the hold took
+			// the weights (pitch 8, roll 0.5) and the allocator still left the left stab at -6 while it sent the right from -30 to
+			// +35 - in command space one stab's travel covered the pitch increment, so the other stayed on the roll; the servo
+			// took 0.9 s over the 65 deg and the nose dropped 40 -> 20 deg AoA meanwhile, then the same stab swung back +35 -> -30
+			// for the push once the hold let go: the "hitch" at 17 deg AoA (q -2 for 0.3 s, then -47). Bounded to what the servos
+			// reach in 0.1 s, the increment is spread over both stabs and the nozzles and no stab swings stop to stop.
+			// 2.41.0 (PushPlanReach): through a planned push the allocator balances the nozzles and wings against where the stabs
+			// will be within PushPlanReachTau s, not where they are sent (see Allocator.ReachPass)
+			// 2.43.0: the stab rate bound (ReleasedStickStabRateBound, 1.8.14 / 2.9.1) is replaced by the allocator's reach model, in the same
+			// places (pitch stick released, or the capped sweep's pitch hold, scaled by the stabs' pitch share) and under a planned push.
+			// The bound clipped each stab command to 0.1 s of servo travel. The reach model keeps the command and places the other surfaces
+			// against where the stab will be in PushPlanReachTau (Allocator.ReachPass), then compares that plan with the stab moved only
+			// as far as it gets in that time, over both horizons and the stab's whole transit (Allocator.TwoHorizon): the bound is the
+			// second plan, chosen when the first one's transit costs more than its destination saves. Not under a plan (2.41.0 unchanged).
+			// The two-horizon pick matters: with the reach pass alone a roll entry at -43 deg AoA (23:37 log, 50.6 s) sent the right stab to
+			// the far stop the wrong way through its range, the roll lagged 0.4 s (pinned command dip 2.8 -> 5.8 deg/s, sideslip 5.7 -> 7.4).
+			float relG = Mathf.Max(relStick, pitchNeedDn) * stabPitchFrac;
+			// Revoker: not while the TrailingEdgeBrakeConfig set moves in or out (see teBrakeMoving: the 0.2.8 exception the stab rate bound had)
+			bool reachHere = ((PushPlan && pushPlanOn) || relG > 0.01f) && !teBrakeMoving;
+			stabRateBound = false;
+			foreach (SurfaceEffector seR in surfaces)
 			{
-				foreach (SurfaceEffector surface12 in surfaces)
+				seR.reachTau = (seR.kind == SurfaceKind.Stabilator && reachHere && PushPlanReachTau > 0f && Engaged && Mode != FcsMode.Ground && Mode != FcsMode.Off) ? PushPlanReachTau : 0f;
+				// Revoker 0.7.0 (RudderReach): the rudder too, always (in flight). It crosses its +-25 deg in ~0.35 s and the solve placed the
+				// yaw nozzle against where the rudder was SENT: 00:44 log, falling-leaf reversals at 73.0 / 76.9 s (69 deg AoA): the rudder sent
+				// -2 -> -25 at the yaw crossing, the nozzle backed off -15 -> -2 as if the rudder were there, the rudder then flipped -25 <-> +25
+				// every few ticks until the nozzle came back for the new side (11-13 deg of nozzle given up, 0.9-1.1 s to the roll's zero).
+				// Placed against where the rudder will be in PushPlanReachTau (0.1 s), the nozzle keeps braking. Bench suite: no case worse by
+				// more than 0.4 deg, roll-then-pull-rev 400 7.6 -> 4.6, sweep reversal worst 9.5 -> 8.5. The leaf dither itself is not on the
+				// bench (its fin sidewash differs): flight-validated.
+				if (RudderReach && seR.kind == SurfaceKind.Rudder && PushPlanReachTau > 0f && Engaged && Mode != FcsMode.Ground && Mode != FcsMode.Off)
 				{
-					if (surface12.kind == SurfaceKind.Stabilator && surface12.active)
-					{
-						float num46 = Mathf.Max(1f, surface12.rate) * Plugin.ReleasedStabRateBound / relRb;
-						surface12.lo = Mathf.Max(surface12.lo, Mathf.Min(surface12.now, surface12.hi) - num46);
-						surface12.hi = Mathf.Min(surface12.hi, Mathf.Max(surface12.now, surface12.lo) + num46);
-					}
+					seR.reachTau = PushPlanReachTau;
 				}
+				seR.twoHorizon = !(PushPlan && pushPlanOn);
 			}
 			// 1.8.40: while rolling at low/moderate AoA, the stabs are not driven past their lift peak in any pass: beyond
 			// it the down-going stab's lift falls off and its nose-down turns into pitch-up exactly when it rolls hardest.
-			if (RpMainStall && (StabWindowAlways || rpGate > 0.01f) && Mathf.Abs(alpha) < RpMainAoA && Engaged && Mode != FcsMode.Ground && Mode != FcsMode.Off)
+			// 2.9.2: also during the capped sweep toward zero AoA with the stabs' pitch range back (see SweepHoldStallWindow)
+			sweepHoldWinDbg = !isAI && sweepClipOn && Mathf.Sign(alpha) * sweepClipDbg < -1f && stabPitchFrac > 0.05f && Engaged && Mode != FcsMode.Ground && Mode != FcsMode.Off;
+			if (sweepHoldWinDbg)
 			{
 				foreach (SurfaceEffector sw in surfaces)
 				{
@@ -4512,6 +6018,14 @@ namespace Revoker_FS12.FCS
 			if (Mode == FcsMode.Ground)
 			{
 				float num19 = 0f - sp;
+				// Revoker 0.2.18: canard travel known at a standstill (see SurfaceEffector.EnsureAsymRange)
+				foreach (SurfaceEffector seA in surfaces)
+				{
+					if (seA.kind == SurfaceKind.Stabilator && seA.active)
+					{
+						seA.EnsureAsymRange(((Component)(object)ac).transform);
+					}
+				}
 				float num20 = sr;
 				if (gsActive && gsMainsContact)
 				{
@@ -4575,7 +6089,15 @@ namespace Revoker_FS12.FCS
 					// Revoker 0.2.1 (GroundElevonPitch): on the runway the trailing-edge elevons follow the pitch stick too (pull = TE up),
 					// as fractions of their own travel; with roll on top the up-going side saturates first
 					float gElev = (surfaceEffector4.kind == SurfaceKind.Aileron && Plugin.ElevonPitch) ? ((0f - num19) * surfaceEffector4.GeoTeUp(((Component)(object)ac).transform) * Plugin.GroundElevonPitch * Mathf.Abs(surfaceEffector4.origRollRange)) : 0f;
-					surfaceEffector4.cmd = Mathf.Clamp(num19 * surfaceEffector4.origPitchRange + num20 * surfaceEffector4.origRollRange + num21 * surfaceEffector4.origYawRange + brakeBias[n] + gToe + gDroop + gElev, surfaceEffector4.min, surfaceEffector4.max);
+					// Revoker 0.2.18: on the runway full pitch stick takes the canards to their full travel that way (push: leading edge
+					// down 70, pull: leading edge up 45), not stick x the stock pitch range (~35 deg): with the +70 travel a full push
+					// reached only half of it (30 Oct logs: stick 0.8 -> 27.7 deg), and only push + brake together reached the stop.
+					float gPitch = num19 * surfaceEffector4.origPitchRange;
+					if (surfaceEffector4.kind == SurfaceKind.Stabilator && Mathf.Abs(gPitch) > 0.0001f)
+					{
+						gPitch = Mathf.Abs(num19) * Mathf.Sign(gPitch) * surfaceEffector4.LimitFor(gPitch);
+					}
+					surfaceEffector4.cmd = Mathf.Clamp(gPitch + num20 * surfaceEffector4.origRollRange + num21 * surfaceEffector4.origYawRange + brakeBias[n] + gToe + gDroop + gElev, surfaceEffector4.min, surfaceEffector4.max);
 				}
 				foreach (HingeFlapEffector hG in hinges)
 				{
@@ -4643,6 +6165,43 @@ namespace Revoker_FS12.FCS
 					// (lead on q itself; taking the trajectory's own acceleration out doubled the bench hitch, 6 -> 12 deg/s)
 					vector12.y -= pitchLeadDbg * vector7.y;
 				}
+				// 2.4.18 yaw slew lead: the rudders reach the other side of their travel no faster than their servo allows (35 deg
+				// at 100 deg/s), so the yaw loop reads the yaw-rate error late by the time they need to swing back through neutral,
+				// keeps accelerating the yaw past its command and then cannot brake it in time. 30 Oct 22:36 log, 51.6-52.4 s:
+				// rudders at +35, yaw rate 42 against a command of 28 -> 7, sideslip -12.4 on the reversal that followed (the
+				// 2.4.17 roll limit held the roll to 30-51 deg/s and did not prevent it). The measured yaw rate is taken ahead
+				// along the measured yaw acceleration by that time (antisymmetric rudder deflection / servo rate), as the 2.2.5
+				// pitch lead does for the nozzles. Rudders near neutral = no lead, so a yaw axis that is keeping up is unchanged.
+				yawLeadDbg = 0f;
+				if (Plugin.YawSlewLead && YawSlewLeadK > 0f && !isAI && (Mode == FcsMode.AoAG || Mode == FcsMode.Rate))
+				{
+					// Revoker 0.3.0: the time each yaw effector (rudder, yaw nozzle) needs to swing back through neutral, weighted by
+					// its one-side yaw (the yaw the loop will have to wait for is each one's share)
+					CollectYawEffs();
+					float tLeadSum = 0f;
+					float wLeadSum = 0f;
+					foreach (YawEff yL in yawEffs)
+					{
+						YawRange(yL, out float zH, out float zL);
+						float wY = 0.5f * Mathf.Abs(zH - zL) * yL.auth;
+						tLeadSum += wY * Mathf.Abs(yL.e.now) / Mathf.Max(1f, yL.e.rate);
+						wLeadSum += wY;
+					}
+					if (wLeadSum > 1E-06f)
+					{
+						float gYL = 1f - Mathf.Clamp01((Mathf.Abs(alpha) - StopSlipA0) / Mathf.Max(1f, StopSlipA1 - StopSlipA0));
+						float tauY = YawSlewLeadK * gYL * tLeadSum / wLeadSum;
+						// only where the yaw is carried onto or past its command within that time (the error closing by at least
+						// half of itself); a yaw rate still building toward a far command is left alone, so roll entries keep their
+						// yaw build-up
+						float travel = tauY * (vector7.z - rCmdRateF * (MathF.PI / 180f));
+						float kY = (Mathf.Abs(vector12.z) > 1E-04f) ? (travel / vector12.z) : ((Mathf.Abs(travel) > 1E-04f) ? 9f : 0f);
+						float gO = Mathf.Clamp01((kY - 0.5f) / 0.5f);
+						gO = gO * gO * (3f - 2f * gO);
+						yawLeadDbg = tauY * gO;
+						vector12.z -= yawLeadDbg * vector7.z;
+					}
+				}
 				omegaDotDes = new Vector3(Plugin.KRoll * vector12.x + pDotFF * (MathF.PI / 180f), Plugin.KPitch * vector12.y + 0.5f * qTraj.v * (MathF.PI / 180f), Plugin.KYaw * vector12.z + rDotFF * (MathF.PI / 180f));
 				float mDotY = (mLeadInit ? ((vector8.y - mPrevY) / num) : 0f);
 				mPrevY = vector8.y;
@@ -4686,6 +6245,7 @@ namespace Revoker_FS12.FCS
 				// with the stick held, pitch rate +-40). Here the yaw target is limited to what the rudders reach with every
 				// other surface where it is now, so the rest of the allocation is not traded away for yaw it cannot get.
 				decelDbg = 0f;
+				yawClampStabDbg = 0f;
 				alloc.fightW[1] = (alloc.fightW[2] = (alloc.fightW[3] = 1f));
 				if (YawTargetClamp && (yawHealth < 0.999f || engOut || engAsym))
 				{
@@ -4760,6 +6320,26 @@ namespace Revoker_FS12.FCS
 							}
 							rudLo += zl;
 							rudHi += zh;
+						}
+						else if (YawClampStabReach && eY is SurfaceEffector sS && sS.kind == SurfaceKind.Stabilator && stabPitchFrac < YawClampStabFree)
+						{
+							// 2.20.0: where the stabs are off the pitch (nozzles carry it, stabPitchFrac -> 0: ~60 deg and up) their
+							// differential IS the yaw axis without fins - the reach includes their yaw range, scaled by how free
+							// they are. 00:25 log (2.19.0, no fins): the clamp held the yaw target at the flaperons' drag-yaw (+8..+20
+							// deg/s^2) against a ~100 demand for 4 s per right-going reversal, stabs idle at -7/+2 with 22-27 deg/s^2
+							// of yaw in their tables; the left-going ones were quick only because the roll loop's stab differential
+							// happened to yaw the right way. On the pitch (2.0.12's one-fin mid-AoA case) the reach is unchanged.
+							float zl = float.MaxValue;
+							float zh = float.MinValue;
+							for (int iS = 0; iS < eY.N; iS++)
+							{
+								zl = Mathf.Min(zl, eY.M[iS].z);
+								zh = Mathf.Max(zh, eY.M[iS].z);
+							}
+							float wFree = Mathf.Clamp01((YawClampStabFree - stabPitchFrac) / YawClampStabFree);
+							rudLo += zNow + wFree * Mathf.Min(0f, zl - zNow);
+							rudHi += zNow + wFree * Mathf.Max(0f, zh - zNow);
+							yawClampStabDbg = wFree;
 						}
 						else
 						{
@@ -5065,10 +6645,6 @@ namespace Revoker_FS12.FCS
 					{
 						continue;
 					}
-					if (DebugBranch)
-					{
-						System.Console.Error.WriteLine($"BRpre {sb.name} a {alpha:F1} cmd {sb.cmd:F1} laoa {sb.LocalAoAAt(sb.cmd):F1} stall {sb.stallAoA:F1} cool {sb.branchCool:F2}");
-					}
 					// 2.0.1: "deep past the peak" and the target are scaled to the stab's own peak (10 and 20 deg were set
 					// for Aryx's 33.75 deg foil), and the attached-side target is searched over the stab's whole travel, not
 					// this tick's rate-limited window: from -30 deg that window never reached the attached side, so the
@@ -5149,10 +6725,6 @@ namespace Revoker_FS12.FCS
 					// make the modelled pitch error worse: at idle they sit pinned holding against the parked stab, so the test
 					// failed every time and the stab stayed in stall (in game, 156-161 s: right stab -30, nozzles +20, AoA 36 -> 0).
 					bool tvcRoom = tvc == null || !tvc.active || Mathf.Abs(tvc.cmd) <= 0.8f * Mathf.Max(1f, tvc.max) || (latIn && BranchFreeTvc && Mathf.Abs(y1 - vector11.y) <= Mathf.Abs(y0 - vector11.y));
-					if (DebugBranch)
-					{
-						System.Console.Error.WriteLine($"BR {sb.name} a {alpha:F1} on {sb.branchOn} bestD {bestD:F1} laoa {sb.LocalAoAAt(sb.cmd):F1} e0 {Mathf.Abs(y0 - vector11.y) * kP:F1} e1 {Mathf.Abs(y1 - vector11.y) * kP:F1} tvc {tvc.cmd:F1} ok {pitchOk} room {tvcRoom}");
-					}
 					if (sb.branchOn)
 					{
 						sb.branchFail = (pitchOk ? 0f : (sb.branchFail + num));
@@ -5301,6 +6873,17 @@ namespace Revoker_FS12.FCS
 				float num35 = Mathf.Max((vector11.z - zero4.z) * Mathf.Sign(vector11.z - vector8.z), YawSatCountClamp ? yawClampExcess : 0f);
 				yawClampExcess = 0f;
 				yawSat = yawSatF.Step(Mathf.Clamp01((num35 * IaInv[2, 2] * 57.29578f - 10f) / 40f), 0.25f, num);
+				// 2.7.0: the allocator's own unmet report per axis, signed with the increment it was asked for (deg/s^2): what the
+				// effectors at their commands fall short of the target by, toward the side the demand went. Read by the measured
+				// pace window as its saturation gate (with the slew still in flight), no surface list, no filter beyond PaceSatTau.
+				Vector3 unmetRaw = new Vector3(Mathf.Max(0f, (vector11.x - zero4.x) * Mathf.Sign(vector11.x - vector8.x)) * IaInv[0, 0] * 57.29578f * Mathf.Sign(vector11.x - vector8.x), Mathf.Max(0f, (vector11.y - zero4.y) * Mathf.Sign(vector11.y - vector8.y)) * IaInv[1, 1] * 57.29578f * Mathf.Sign(vector11.y - vector8.y), Mathf.Max(0f, num35) * IaInv[2, 2] * 57.29578f * Mathf.Sign(vector11.z - vector8.z));
+				allocUnmet = allocUnmetF.Step(unmetRaw, PaceSatTau, num);
+				// the stock-jet capacity estimator (every effector grouped, sideslip-axis read), from this tick's commands (restores them).
+				// It drives the governor from this version on, so it runs every tick, logging or not. The last argument is the F-22E's
+				// rudder-fade weight, kept for the telemetry; the estimator's own rudW comes from its probes.
+				// Revoker 0.8.2: what the allocation left unmade of the INDI target (deg/s^2), before the estimator's probes re-solve
+				allocResMain = alloc.Accel(alloc.resDbg);
+				capEst.Step(effs, alloc, vector7, IaInv, zero4, num, unmetRaw, alpha, Mathf.Clamp01(rudderAuth) * Mathf.Clamp01(yawHealth / 0.5f));
 				float num36 = 10f;
 				float num37 = 1f;
 				if (tvc.engines.Count > 0 && tvc.engines[0] != null)
@@ -5635,13 +7218,10 @@ namespace Revoker_FS12.FCS
 
 		internal static float RpGateSpan = 1f;
 
-		internal static bool RpMainStall = false;
 
-		internal static float RpMainAoA = 18f;
 
 		internal static float RpMainStallMargin = 3f;
 
-		internal static bool StabWindowAlways = false;
 
 		internal static float StabParkAoA = 30f;
 
@@ -5696,6 +7276,8 @@ namespace Revoker_FS12.FCS
 
 		private bool settledWin;
 
+		public Vector3 allocResMain;
+
 		public bool settledWinDbg;
 
 		// 0.4.6 telemetry: the thrust moment's yaw about the CoM, which dMeasY leaves out (the nozzles are an effector, so their
@@ -5706,8 +7288,19 @@ namespace Revoker_FS12.FCS
 		private float settledUseF;
 
 		private bool settledUseHi;
+		internal static float CoordStopErr0 = 3f;
 
-		// narrow lo..hi to the deflections whose local AoA stays within +-lim (keeps the side the surface is on if none do)
+
+
+
+
+		// 2.3.3 rate-capture effector lag: servo/actuator lag added to the unwind time (s)
+		internal static float RateCaptureLagServo = 0.06f;
+
+		public float rateCapLagDbg;
+		public Vector3 axWDbg;   // 0.6.0: the allocator axis weights this tick (telemetry)
+		public float sweepLimDbg, stopSlipHoldDbg;   // 0.6.0: retired with the 2.6.6 sweep cap and the AoA-rise cap (F-22E 3.0.0 replaced them); kept as columns, always 0
+
 		private static void StallWindow(SurfaceEffector se, float lim)
 		{
 			float a = float.MaxValue;
@@ -5739,6 +7332,28 @@ namespace Revoker_FS12.FCS
 			}
 			se.lo = lo;
 			se.hi = hi;
+		}
+
+		// 2.14.0 telemetry: the stabilators' allocator windows and pair costs (index 0 = first stab found, 1 = second), for the no-fin stop diagnosis
+		private float StabWin(int which, bool lo)
+		{
+			int k = 0;
+			foreach (SurfaceEffector se in surfaces)
+			{
+				if (se.kind != SurfaceKind.Stabilator) continue;
+				if (k == which) return lo ? se.lo : se.hi;
+				k++;
+			}
+			return 0f;
+		}
+
+		private float StabCost(bool anti)
+		{
+			foreach (SurfaceEffector se in surfaces)
+			{
+				if (se.kind == SurfaceKind.Stabilator) return anti ? se.antiCost : se.symCost;
+			}
+			return 0f;
 		}
 
 		private float PitchSum()
@@ -5921,7 +7536,6 @@ namespace Revoker_FS12.FCS
 
 		internal static float AuthCapFixedAoA = 36f;
 
-		internal static bool AuthCapRudderToe = false;
 
 		private bool authFixedOn;
 
@@ -6282,8 +7896,24 @@ namespace Revoker_FS12.FCS
 						tvMax = Mathf.Max(tvMax, tvc.M[tvI].y);
 						tvMin = Mathf.Min(tvMin, tvc.M[tvI].y);
 					}
-					tvUp = Mathf.Max(0f, (tvMax - tvc.Mnow.y) * IaInv[1, 1] * 57.29578f);
-					tvDn = Mathf.Max(0f, (tvc.Mnow.y - tvMin) * IaInv[1, 1] * 57.29578f);
+					// Revoker 0.2.12 (LatReserveTvcFull): the nozzles' share is their whole travel either side of mid-travel, not
+					// what is left from where they are now. Measured from the current nozzle angle, the share shrank as the
+					// nozzles moved to brake the pitch (none left at the stop), so the reserve took 70 % of everything and the
+					// authority the capture planned with fell 120 -> 42 deg/s^2 mid-stop. The capture then cut the pitch command
+					// (48 -> 21 deg/s), the nozzles came off the stop, the authority came back and the command rose again: the
+					// AoA stepped in to the negative limit in two or three surges (29 Oct 11:40 log, 90-93 s and 120-123 s, full push +
+					// full roll at 150 kt, capture from -34 deg against the -55 limit).
+					float tvMid = 0.5f * (tvMax + tvMin);
+					if (LatReserveTvcFull)
+					{
+						tvUp = Mathf.Max(0f, (tvMax - tvMid) * IaInv[1, 1] * 57.29578f);
+						tvDn = Mathf.Max(0f, (tvMid - tvMin) * IaInv[1, 1] * 57.29578f);
+					}
+					else
+					{
+						tvUp = Mathf.Max(0f, (tvMax - tvc.Mnow.y) * IaInv[1, 1] * 57.29578f);
+						tvDn = Mathf.Max(0f, (tvc.Mnow.y - tvMin) * IaInv[1, 1] * 57.29578f);
+					}
 				}
 				aUpP = Mathf.Max(20f, aUp - latReserve * Mathf.Max(0f, aUp - tvUp));
 				aDnP = Mathf.Max(20f, aDn - latReserve * Mathf.Max(0f, aDn - tvDn));
@@ -6622,6 +8252,7 @@ namespace Revoker_FS12.FCS
 					num19 = Mathf.Min(num8 - authRateDn, Mathf.Max(num19, 0f - AuthRateMin));
 				}
 			}
+			capAtLimU = capAtLimD = false;
 			capPushU = (capPushD = 0f);
 			if (!flag)
 			{
@@ -6651,6 +8282,8 @@ namespace Revoker_FS12.FCS
 				// trims what the flight-path-rate estimate misses. Only while the pilot asks for more than the limit.
 				bool capAtU = num20 >= num3 - 0.01f && Mode == FcsMode.AoAG && num9 > 0.5f;
 				bool capAtD = num21 <= num4 + 0.01f && Mode == FcsMode.AoAG && num9 > 0.5f;
+				capAtLimU = capAtU && alpha > num20 - 2f;
+				capAtLimD = capAtD && alpha < num21 + 2f;
 				float capNegU = (capAtU && eCapU < 0f) ? (3f * eCapU) : 0f;
 				float capNegD = (capAtD && eCapD < 0f) ? (3f * eCapD) : 0f;
 				aBrakeTgt = aDn;
@@ -6844,7 +8477,7 @@ namespace Revoker_FS12.FCS
 				float num36 = Mathf.Max(num8 - num35, 0f - Plugin.ProtRate);
 				float num37 = 1f - Mathf.Clamp01(sp / 0.9f);
 				num34 = ((num36 < 0f) ? (num36 * num37) : num36);
-				num34 = Mathf.Min(num34, qPilot);
+				if (!StickCancelsLimit || qRaw < num34) num34 = Mathf.Min(num34, qPilot);
 				num18 = (num19 = num34);
 				// 1.9.3: the protection state (pitch priority in the allocator, fight costs off, ...) only past ProtFlagBand,
 				// so a jet holding the limit in a turn does not toggle it every few frames
@@ -6858,7 +8491,7 @@ namespace Revoker_FS12.FCS
 				float num39 = Mathf.Min(num8 + num38, Plugin.ProtRate);
 				float num40 = 1f - Mathf.Clamp01((0f - sp) / 0.9f);
 				num34 = ((num39 > 0f) ? (num39 * num40) : num39);
-				num34 = Mathf.Max(num34, qPilot);
+				if (!StickCancelsLimit || qRaw > num34) num34 = Mathf.Max(num34, qPilot);
 				num18 = (num19 = num34);
 				prot = eN > ProtFlagBand;
 			}
@@ -6878,13 +8511,16 @@ namespace Revoker_FS12.FCS
 				}
 				if (Mode == FcsMode.AoAG)
 				{
+					// 2.44.0 (StickCancelsLimit): at the AoA limit the limit's own nose-down (the capture bound) scales with 1 - stick / 0.9
+					float flU = (StickCancelsLimit && capAtLimU) ? Mathf.Min(0f, num18) * (1f - Mathf.Clamp01(sp / 0.9f)) : 0f;
+					float flD = (StickCancelsLimit && capAtLimD) ? Mathf.Max(0f, num19) * (1f - Mathf.Clamp01((0f - sp) / 0.9f)) : 0f;
 					if (sp > 0.02f && alpha > -2f)
 					{
-						num34 = Mathf.Max(num34, (nz > num5) ? ((0f - Plugin.ProtRate) * (1f - sp)) : 0f);
+						num34 = Mathf.Max(num34, (nz > num5) ? ((0f - Plugin.ProtRate) * (1f - sp)) : flU);
 					}
 					else if (sp < -0.02f && alpha < 2f)
 					{
-						num34 = Mathf.Min(num34, (nz < num6) ? (Plugin.ProtRate * (1f + sp)) : 0f);
+						num34 = Mathf.Min(num34, (nz < num6) ? (Plugin.ProtRate * (1f + sp)) : flD);
 					}
 				}
 			}
@@ -6911,301 +8547,160 @@ namespace Revoker_FS12.FCS
 			// sideslip ran to -70 deg and the reversed dihedral at negative AoA drove the roll up to 43 deg/s against the
 			// command. The AoA rate is held to what the lateral axes can follow; a sweep that brings rS back to zero is free.
 			// Measured state only; off with no roll (|pS| under SweepPs0), beyond the AoA limits and for AI.
-			sweepLimDbg = 0f;
 			pullGovTouched = false;
 			pullTradeTgt = 999f;
+			tradeAlphaNew = -1f;
 			pullTradeHoldDbg = false;
 			float qAskPre = num34;
-			if (Plugin.SweepYawLimitOn && SweepYawK > 0f && flag && !prot && !isAI && tas > 25f && Mode == FcsMode.AoAG)
-			{
-				float saS = Mathf.Sin(alpha * (MathF.PI / 180f));
-				float caS = Mathf.Cos(alpha * (MathF.PI / 180f));
-				float pSw = (omega.x * caS + omega.z * saS) * 57.29578f;
-				float rSw = (0f - omega.x * saS + omega.z * caS) * 57.29578f;
-				float wS = Mathf.Clamp01((Mathf.Abs(pSw) - SweepPs0) / Mathf.Max(1f, SweepPsSpan));
-				if (wS > 0f)
-				{
-					// only the yaw axis counts: the lateral law brakes the body roll with the velocity-vector roll, so the roll axis
-					// does not hold p up to re-coordinate the rate vector (bench: counting it let the sweep run at 50 deg/s from 60 deg)
-					float cS = aYaw * Mathf.Abs(caS) + SweepRollShare * aRoll * Mathf.Abs(saS);
-					float aDotMax = Mathf.Max(SweepFloor, SweepYawK * cS / Mathf.Abs(pSw) * 57.29578f);
-					aDotMax = Mathf.Lerp(SweepOff, aDotMax, wS);
-					// d rS / dt = -pS * alphaDot: AoA rising makes rS more negative when pS > 0. A sweep that brings rS back
-					// toward zero is not limited (beyond SweepFreeBand of rS).
-					float hiS = num8 + aDotMax;
-					float loS = num8 - aDotMax;
-					float fb = Mathf.Clamp01((Mathf.Abs(rSw) - SweepFreeBand) / Mathf.Max(0.5f, SweepFreeBand));
-					// pulls at positive AoA are left alone (aero weathercock holds the sideslip there; the 2.0.15 positive-AoA
-					// law is unchanged); nose-down sweeps, and pulls from negative AoA, are limited
-					float posLimRate = -1f;
-					if (alpha > 0f && SweepPosPullFree)
-					{
-						hiS = 999f;
-						// 2.2.7 sideslip-margin AoA-rise governor (replaces the 2.2.4 roll-rate limit, whose fade-in
-						// lerp(999, limit, w) left it at ~300 deg/s - no limit - below ~200 deg/s of roll; 17 Oct log: sideslip 19-21 deg
-						// in pulls from low AoA rolling at 60-135 deg/s, 290-380 km/h, sweepLim 0).
-						// A roll pS at AoA a is coordinated with a stability-axis yaw rate of pS sin a, so a rising AoA drives the
-						// sideslip toward sign(pS) at pS x alphaDot until the yaw catches up. Two bounds on the AoA rise:
-						//  - feed-forward: what the measured yaw authority can follow, SweepPosK x aYaw cos a / pS;
-						//  - sideslip margin: the sideslip error (less the pedal command) and where it is heading (kinematic sideslip
-						//    rate x SlipGovLead), on the side the AoA rise pushes it; from PullGovStart x margin the allowed rise
-						//    tapers to zero (AoA held) at the margin, PullSideslipMargin (dev, default 6 deg).
-						// Measured state only. Only with the jet rolling (|pS| from 10, full by 20 deg/s), only nose-up.
-						float wP = Mathf.Clamp01((Mathf.Abs(pSw) - SlipGovPs0) / Mathf.Max(1f, SlipGovPsSpan));
-						if (Plugin.SweepPosLimitOn && wP > 0f)
-						{
-							pullGovTouched = true;
-							float sgP = Mathf.Sign(pSw);
-							float bE = beta - betaPedalCmd;
-							// 2.2.10: the look-ahead covers the time the pitch rate needs to come down to the AoA-hold rate as well
-							// (at the measured nose-down authority), and adds the sideslip the AoA still rising over that time builds
-							// with nothing from the yaw (pS x alphaDot, x PullGovAccK). 19 Oct 10:00 log, 270.3-272 s: full aft + full
-							// roll at 112 m/s, q 55 deg/s past its 48 command when the roll reached 85 deg/s; the governor cut the
-							// command at 271.1 s but the AoA rose 23 -> 33 deg while q came down and the sideslip ran to 18 deg.
-							float aRise = Mathf.Max(0f, omega.y * 57.29578f - num8);
-							float wLo = Mathf.Clamp01((PullGovStopA1 - alpha) / 15f);
-							float tLead = SlipGovLead + PullGovStopK * wLo * aRise / Mathf.Max(40f, aDn);
-							float bP = bE + slipRateDbg * tLead + sgP * 0.5f * PullGovAccK * wLo * Mathf.Abs(pSw) * (MathF.PI / 180f) * aRise * tLead * tLead;
-							float xs = sgP * ((sgP * bP > sgP * bE) ? bP : bE);
-							pullXsDbg = xs;
-							pullLeadDbg = tLead;
-							float mg = Plugin.PullSideslipMargin;
-							// the feed-forward scales with the margin (6 deg = SweepPosK): a wider margin buys a faster AoA rise.
-							// 2.2.8: taper from 70 % of the margin (was 35 %) and lead 0.3 s (was 0.5), so the sideslip runs up to the
-							// margin (19 Oct log, 112-117 s: held at 3-4 deg of a 6 deg margin).
-							float aDotP0 = SweepPosK * (mg / 6f) * aYaw * Mathf.Abs(caS) / Mathf.Abs(pSw) * 57.29578f;
-							// 2.2.24: the feed-forward's share of the yaw authority (SweepPosK) is a fixed guess at how fast the yaw
-							// follows; in the 20 Oct 00:58 log it held the AoA rise to ~10 deg/s at 100-125 kt with the sideslip at 1-4 deg
-							// of a 9 deg margin (slipGovPull 1, sweepLim 10). It is now scaled up while the measured sideslip (with its
-							// lead) stays under PullFFBoostLo of the margin and the stick asks for more, and scaled back as it passes
-							// PullFFBoostHi, so the AoA rises as fast as the sideslip allows up to the margin. The sideslip taper below
-							// still holds the margin itself.
-							// off with a rudder lost: the sideslip there comes from the roll itself, not the AoA rise (bench, both fins
-							// gone: up to +2 deg with it on)
-							if (Plugin.PullFFBoostMax > 1f && yawHealth >= 0.99f)
-							{
-								float useB = xs / Mathf.Max(0.5f, mg);
-								float askB = num34 - num8;
-								float rB = 0f;
-								// 2.2.25 (PullFFBoostSlipFall): also backed off as soon as the sideslip is building fast on the AoA-rise side,
-								// not only once it is near the margin, so the AoA rise eases in place of the taper stopping it late
-								// 2.2.26 (PullFFBoostSlipT): the sideslip rate the boost tolerates is the margin left over PullFFBoostSlipT
-								// seconds (never below PullFFBoostSlipRate), so a 2-3 deg/s drift with 6 deg of margin left no longer stops it
-								// (20 Oct 02:03 log, 100-160 kt: boost 1.2-2.1, sideslip 2-5 of 9 deg)
-								float srTol = (PullFFBoostSlipT > 0f) ? Mathf.Max(PullFFBoostSlipRate, (mg - Mathf.Max(0f, sgP * bE)) / PullFFBoostSlipT) : PullFFBoostSlipRate;
-								float srF = (PullFFBoostSlipFall && srTol > 0f) ? Mathf.Clamp01((sgP * slipRateDbg - srTol) / srTol) : 0f;
-								if (useB > PullFFBoostHi || srF > 0f)
-								{
-									rB = -PullFFBoostFall * ((useB > PullFFBoostHi) ? 1f : srF);
-								}
-								else if (useB < PullFFBoostLo && askB > aDotP0 * pullFFBoost + 1f)
-								{
-									// and only while the sideslip is not already running toward the margin (its kinematic rate on the side
-									// the AoA rise drives it under PullFFBoostSlipRate): a boost while it builds gave the pitch rate a
-									// momentum the taper could not stop in time (bench, full aft + full roll together at 140 kt: 10.8 deg)
-									float srB = Mathf.Clamp01(1f - sgP * slipRateDbg / Mathf.Max(0.1f, srTol));
-									rB = PullFFBoostRise * (1f - useB / Mathf.Max(0.01f, PullFFBoostLo)) * srB;
-								}
-								if (PullFFBoostStatic)
-								{
-									// 2.2.26 (PullFFBoostStatic): the boost follows the margin used (sideslip with its lead) directly: full
-									// below PullFFBoostSLo of the margin, 1 at PullFFBoostSHi, linear between, slewed at the rise / fall
-									// rates. The 2.2.24/25 integrating boost either stalled on the sideslip-rate gates at low IAS (boost
-									// 1.2-2.1 with 2-5 of 9 deg used, 02:03 log) or, with them loosened, wound up and was caught late by
-									// the taper (pitch-rate dips back to 10-25 deg/s on the bench).
-									float bT = 1f + (Plugin.PullFFBoostMax - 1f) * Mathf.Clamp01((PullFFBoostSHi - useB) / Mathf.Max(0.05f, PullFFBoostSHi - PullFFBoostSLo));
-									if (askB <= aDotP0 + 1f)
-									{
-										bT = Mathf.Min(bT, pullFFBoost);
-									}
-									pullFFBoost = Mathf.MoveTowards(pullFFBoost, bT, ((bT > pullFFBoost) ? PullFFBoostRise : PullFFBoostFall) * dt);
-								}
-								else
-								{
-									pullFFBoost = Mathf.Clamp(pullFFBoost + rB * dt, 1f, Plugin.PullFFBoostMax);
-								}
-							}
-							else
-							{
-								pullFFBoost = 1f;
-							}
-							float aDotP = Mathf.Max(SweepPosFloor, aDotP0 * pullFFBoost);
-							// 2.2.27 (PullGovServo): the AoA rise is the feed-forward plus a term that steers the sideslip to
-							// PullServoTarget of the margin. With the yaw maxed, the sideslip rate goes as roll x (AoA rate - the rate the
-							// yaw follows), so AoA rate = FF + K x (target - sideslip) / roll brings the sideslip to the target with a
-							// PullServoK time constant and no overshoot; above the target it slows the rise below the FF. Replaces the
-							// 2.2.24-26 boost. The roll trade is judged on the FF alone, so the roll is as before.
-							float aDotPff = Mathf.Max(SweepPosFloor, aDotP0);
-							// servo weight: on with all fins, faded out between PullServoPs0 and PullServoPs1 of roll (at a fast roll the
-							// margin buys little AoA, sideslip / roll rate, and the sideslip moves too fast to steer: bench, 230 kt at
-							// 80-90 deg/s, 7 deg and a 36 deg/s dip); where it is out, the 2.2.25 boost governor flies as before
-							float fSv = (PullServoPs1 > PullServoPs0) ? Mathf.Clamp01((PullServoPs1 - Mathf.Abs(pSw)) / (PullServoPs1 - PullServoPs0)) : 1f;
-							float wSv = (PullGovServo && yawHealth >= 0.99f) ? ((PullServoBlend || PullServoMax) ? fSv : 1f) : 0f;
-							pullServoWDbg = wSv;
-							if (wSv > 0f)
-							{
-								if (!PullServoAdd && !PullServoMax)
-								{
-									pullFFBoost = Mathf.Lerp(pullFFBoost, 1f, wSv);
-								}
-								float bSv = PullServoUseXs ? xs : (sgP * bE + sgP * slipRateDbg * PullServoLead);
-								float ex = PullServoK * (PullServoTarget * mg - bSv) * 57.29578f / Mathf.Max(5f, Mathf.Abs(pSw));
-								// only while the stick asks for more AoA rise than the FF allows; otherwise nothing is built up in advance
-								// (a roll before the pull had wound it to 8 deg/s, so the pull started with the full extra)
-								if (num34 - num8 <= aDotP0 + 1f)
-								{
-									ex = Mathf.Min(ex, 0f);
-								}
-								// the extra rate rises at PullServoSlew deg/s per s at most (falls at once), so it builds as the margin is
-								// used instead of bursting at the pull and then dipping
-								if (PullServoSlew > 0f && ex > pullServoEx)
-								{
-									ex = Mathf.Min(ex, pullServoEx + PullServoSlew * dt);
-								}
-								pullServoEx = ex;
-								if (!PullServoBlend && !PullServoMax && ex > 0f)
-								{
-									ex *= fSv;
-								}
-								// and backed off while the sideslip is already running fast toward the margin (PullServoSr0 -> 2x)
-								if (PullServoSr0 > 0f && ex > 0f)
-								{
-									ex *= Mathf.Clamp01(1f - (sgP * slipRateDbg - PullServoSr0) / PullServoSr0);
-								}
-								aDotP = PullServoMax ? Mathf.Max(aDotP, aDotP0 + ex * wSv) : PullServoAdd ? Mathf.Max(SweepPosFloor, aDotP + ex * wSv) : Mathf.Lerp(aDotP, Mathf.Max(SweepPosFloor, aDotP0 + ex), wSv);
-								pullServoDbg = ex * wSv;
-							}
-							else
-							{
-								pullServoEx = 0f;
-								pullServoDbg = 0f;
-							}
-							float gS = Mathf.Lerp((yawHealth >= 0.99f) ? PullGovStart : Mathf.Min(PullGovStart, PullGovStartFinLoss), PullServoGovStart, wSv);
-							// 2.2.27: with the servo steering the sideslip, the taper is only the backstop at the margin and judges the
-							// sideslip with the short lead alone; on the stop-time projection it cut the pitch rate at 4.5 deg of real
-							// sideslip (projection 8), and the servo pushed it back up: a dip each pull
-							float xsG = xs;
-							if (wSv > 0f && PullServoShortLead)
-							{
-								float bPs = bE + slipRateDbg * SlipGovLead;
-								// short lead where the servo steers (slow roll); the full stop-time projection again toward a fast roll, where
-								// the sideslip runs at 10-12 deg/s and the short lead caught it late (bench, 216 kt: 7.6 deg and an unload)
-								xsG = Mathf.Lerp(xs, sgP * ((sgP * bPs > sgP * bE) ? bPs : bE), wSv * (PullServoLeadByRoll ? fSv : 1f));
-							}
-							float g = 1f - Mathf.Clamp((xsG - gS * mg) / Mathf.Max(0.5f, (1f - gS) * mg), 0f, 1f + PullGovUnloadSpan);
-							// 2.2.10: the look-ahead may hold the AoA but not unload it; unloading (g < 0) goes on the sideslip the
-							// jet has (and its 0.3 s trend), not on the stop-time projection. Unloading on the projection swung the
-							// sideslip to the other side (bench, lateral added mid-pull at 600 km/h: -11 deg).
-							if (g < 0f && UnloadOnLeadOnly)
-							{
-								float bP0 = bE + slipRateDbg * SlipGovLead;
-								float xs0 = sgP * ((sgP * bP0 > sgP * bE) ? bP0 : bE);
-								float g0 = 1f - Mathf.Clamp((xs0 - gS * mg) / Mathf.Max(0.5f, (1f - gS) * mg), 0f, 1f + PullGovUnloadSpan);
-								g = Mathf.Max(g, Mathf.Min(0f, g0));
-							}
-							// 2.2.29 (PullServoNoUnload): with the servo steering, past the margin the AoA is held, not unloaded. In a held
-							// corkscrew at 160-215 kt the unload (pitch command 46 -> 5) and the servo's push back up pumped the AoA
-							// 25 -> 38 -> 31 -> 39 deg every ~1.2 s (20 Oct 10:35 log, 277-281 s)
-							if (wSv > 0f && PullServoNoUnload && g < 0f)
-							{
-								g = Mathf.Lerp(g, 0f, wSv);
-							}
-							// tightens at up to PullGovFallRate per second, releases at PullGovRiseRate, so a passing sideslip
-							// excursion does not pulse the pitch command (48 -> 15 -> 48 deg/s in 0.2 s on the bench at 600 km/h)
-							pullGovF = Mathf.MoveTowards(pullGovF, g, ((g < pullGovF) ? PullGovFallRate : PullGovRiseRate) * dt);
-							g = pullGovF;
-							slipGovPullDbg = g;
-							// past the margin (g < 0) the AoA may come back down at up to PullGovUnloadRate, which lowers the yaw rate
-							// the roll needs (pS sin a)
-							aDotP = (g >= 0f) ? (aDotP * g) : (g / Mathf.Max(0.01f, PullGovUnloadSpan) * PullGovUnloadRate);
-							aDotPff = (g >= 0f) ? (aDotPff * g) : aDotP;
-							// 2.2.20: no unload at low AoA. Unloading lowers the yaw rate the roll needs (pS sin a), which is near zero
-							// there anyway; a sideslip made by the roll itself (fins gone) was unloaded to 0 deg AoA, the governor let go
-							// there, the stick pulled it back up and it unloaded again: a 1.2 s pitch cycle, qCmd -13 <-> 48 (bench,
-							// both fins detached, full aft + full roll at 460 km/h). Below UnloadA0 it holds the AoA instead.
-							if (aDotP < 0f && UnloadFadeFix)
-							{
-								aDotP *= Mathf.Clamp01((alpha - UnloadA0) / Mathf.Max(1f, UnloadASpan));
-							}
-							// 2.2.20: the fade-in with roll (wP) loosens a hold (aDotP >= 0, divided by wP) but must weaken an unload
-							// (aDotP < 0, times wP). Divided, an unload grew as the roll came down toward SlipGovPs0, to the full
-							// -48 deg/s nose-down, and the cap vanished once the roll was under it: the pitch command went
-							// 48 -> -48 -> 48 deg/s in 0.2 s each time the roll crossed 10 deg/s (19 Oct 21:37 log, 211-212 s,
-							// fins gone, sideslip 10-14 deg; the nozzles stop to stop).
-							hiS = num8 + ((aDotP >= 0f || !UnloadFadeFix) ? Mathf.Min(999f, aDotP / Mathf.Max(0.02f, wP)) : (aDotP * wP));
-							posLimRate = Mathf.Max(0f, aDotP);
-							// 2.2.8 PullRollTrade: the AoA rise the pilot asks for beyond what the governor allows is bought back by
-							// slowing the roll. The sideslip a rising AoA makes goes as pS x alphaDot, so the roll that lets the whole
-							// asked rise through is pS x allowed / asked (floor PullTradeFloor); the roll limit goes PullRollTrade of
-							// the way from the normal limit to it. Released once the governor lets the asked rise through.
-							float aAsk = num34 - num8;
-							// 2.2.26: while the stick still asks for AoA rise in a governed rolling pull, the trade lets the roll back
-							// only at PullTradeRiseHold (an earlier, quick release rebuilt the roll mid-pull and the governor then cut the
-							// pitch rate: bench, 230 kt, roll 37 -> 82 deg/s at 23-27 deg AoA, pitch rate 51 -> 25 deg/s)
-							pullTradeHoldDbg = aAsk > 5f;
-							// 2.2.24: with PullFFBoostTrade off the trade is judged on the un-boosted rate, so the roll is slowed as in
-							// 2.2.23 and the boost goes to the AoA
-							float posLimTr = Mathf.Lerp(PullFFBoostTrade ? posLimRate : (posLimRate / pullFFBoost), Mathf.Max(0f, aDotPff), wSv);
-							if (Plugin.PullRollTrade > 0f && aAsk > posLimTr + 1f)
-							{
-								pullTradeTgt = Mathf.Max(PullTradeFloor, Mathf.Abs(pSw) * posLimTr / Mathf.Max(0.5f, aAsk));
-								// start from the roll in force (2.2.11: also when an earlier, looser limit is still above it)
-								if (pullTradePs > Mathf.Max(Mathf.Abs(pSw), pullTradeTgt))
-								{
-									pullTradePs = Mathf.Max(Mathf.Abs(pSw), pullTradeTgt);
-								}
-							}
-						}
-					}
-					// 2.2.9 (PullGovSmooth, default on): in the rolling-pull governor the AoA-sweep limit's free band (yaw ahead
-					// of the roll, rS beyond 4..8 deg/s, so a rising AoA brings rS back to zero) no longer releases the cap. It
-					// switched the cap between the governor's rate and 999 as rS crossed the band, and the sideslip loop then
-					// cycled: 19 Oct 09:33 log, 127-131 s, qCmd 48 -> -4 -> 48 -> 19 -> 48 -> 29 -> 47 in 3 s with the
-					// sideslip 1.5 -> 7.4 -> 1.2 -> 4.3 deg and the nozzles stop to stop. The sideslip governor already sees
-					// the yaw lead through the kinematic sideslip rate.
-					if (pSw * rSw > 0f && !(posLimRate >= 0f && Plugin.PullGovSmooth))
-					{
-						hiS = Mathf.Lerp(hiS, 999f, fb);
-					}
-					else if (pSw * rSw < 0f)
-					{
-						loS = Mathf.Lerp(loS, -999f, fb);
-					}
-					// 2.2.9 (PullGovSmooth): when the governor's cap rises it does so with a GovCapTau lag (it still falls at
-					// once), so a release does not throw the command straight back to the stick's 48 deg/s.
-					if (posLimRate >= 0f && GovCapTau > 0f && Plugin.PullGovSmooth)
-					{
-						float capT = Mathf.Min(hiS, 120f);
-						govCapQ = ((govCapOn && capT > govCapQ) ? Mathf.Lerp(govCapQ, capT, Mathf.Clamp01(dt / GovCapTau)) : capT);
-						govCapOn = true;
-						hiS = govCapQ;
-					}
-					else
-					{
-						govCapOn = false;
-					}
-					float before = num34;
-					num34 = Mathf.Clamp(num34, loS, hiS);
-					sweepLimDbg = (num34 != before) ? ((num34 == hiS && posLimRate >= 0f) ? Mathf.Max(0.01f, posLimRate) : aDotMax) : 0f;
-				}
-			}
+			// 0.4.2: whether the pitch command is asking for a sweep at all. The FF roll trade's ask is the command's distance
+			// from the measured flight-path rate (qAskPre - wVe); with the stick in the detent the command is *exactly* zero
+			// (qRaw = sp x qB behind the num9 detent gate), so that distance becomes the measured rate itself and the trade
+			// pays for a sweep nobody asked for. Rolling at 250 km/h through zero AoA with the pitch stick centred, the jet's
+			// own settling sweeps the AoA 12 -> -2 deg at 2-7 deg/s, and the trade read that as a 2-7 deg/s ask: the roll-rate
+			// limit swung 30 <-> 160 deg/s as it wandered - the roll "randomly speeding up and down" at low IAS. The Raptor
+			// hides it: its rudders keep the capacity high enough that the same cut only moves the limit 106-127.
+			// The pilot's stick (the law's own detent gate) and any bound that actually bound the command - protection, the
+			// g / AoA-rate clamps, the unload - all count; a centred stick with nothing binding does not. A steady rolling
+			// pull still trades (the stick is out of the detent), and the ask there is 0 anyway once the g has settled.
+			// |sp| > 0.04 is the law's own detent (num9 = Clamp01((|sp| - 0.01) / 0.06) crosses 0.5 there), written on sp
+			// directly so it reads the same under the rate law, where num9 stays 1
+			bool qSweepAsk = Mathf.Abs(sp) > 0.04f || prot || protHold || Mathf.Abs(num34 - qRaw) > 0.05f;
+			// 2.4.16: also with PitchRateCommandOnly (FcsMode.Rate). The sweep limit, the rolling-pull sideslip governor and
+			// PullRollTrade only ever act on the pitch-rate command (num34) and the measured state, so they apply the same way
+			// under the rate law; gated to AoAG they were simply off there (28-29 Oct logs, mode 6: sweepLim 0, slipGovPull 1,
+			// pullTrade 0 in every rolling pull; full aft + full roll ran to 17-23 deg of sideslip at 150-340 kt)
 			// 2.2.11 PullRollTrade, feed-forward part: with the trade on, the roll limit is also set from the AoA rate the
 			// stick asks for, before the governor has to react: the roll whose coordinating yaw the yaw axis can build while
 			// the AoA rises at that rate (the governor's own feed-forward, solved for pS). At high IAS the roll got to
 			// 140-157 deg/s inside 0.4 s while the AoA rose at 50-60 deg/s; the governor caught it on the sideslip and
 			// unloaded, and pitch and roll hitched together (19 Oct 10:29 log, 254 s at 295 kt: sideslip 14.7 deg, q 61 -> 5
 			// -> 40, pS 138 -> 56 -> 129; 467 s at 345 kt the same).
-			if (Plugin.PullRollTrade > 0f && PullTradeFFK > 0f && Plugin.SweepYawLimitOn && Plugin.SweepPosLimitOn && SweepPosPullFree && flag && !prot && !isAI && tas > 25f && Mode == FcsMode.AoAG && alpha > 0f)
+			// 2.5.2 roll first, then pitch: the lateral governor's AoA-rise cap (yaw saturated with the roll already held; see
+			// LateralLaw) holds the nose-up pitch-rate command to the AoA-hold rate plus that rise, with the 2.2.9 release lag
+			// 2.5.3: both ways. The yaw the pair needs is |pS sin AoA|; any AoA sweep under a roll changes it at pS cos AoA x AoA
+			// rate, nose-up or nose-down, at positive or negative AoA. A sweep that grows the demand is paid from the yaw left
+			// on the roll's side (yawSatAlphaRate); one that shrinks it from the rudders' other side (yawSatAlphaRateDn). This is
+			// the 2.1.8 sweep yaw limit (off from RollGovernorReplaces 2) from the same rule as the pull cap, so a full push +
+			// full roll from positive AoA no longer sweeps the yaw demand through zero faster than the rudders can swing (bench,
+			// 300 km/h: the roll outran the yaw at the zero crossing and the sideslip diverged).
+			yawSatPitchDbg = 0f;
+			float num34Ask = num34;
+			bool planOwns = PushPlan && pushPlanOn && PushPlanOwnsPitch;
+			if (yawSatAlphaRate > 0f && flag && !prot && !isAI && LatGovMode && !planOwns)
 			{
-				float aAskF = qAskPre - num8;
+				// nose-up pitch grows |AoA| at positive AoA and shrinks it at negative AoA
+				float upRate = (alpha >= 0f) ? yawSatAlphaRate : yawSatAlphaRateDn;
+				float dnRate = (alpha >= 0f) ? yawSatAlphaRateDn : yawSatAlphaRate;
+				// 2.24.0 (SweepNoReverse), 2.31.1 written into the rates: a sweep toward zero AoA may be paced down to the flight-path
+				// rotation, never below it (the nose is held, never turned back: the pitch-rate command the pace leaves is never on the
+				// far side of zero). Held pushes too (SweepNoReverseHeld, 2.25.0); not under the no-fin nose-hold (2.19.0: holding the
+				// AoA on a turning flight path IS a positive body rate; with the floor the no-fin held pushes departed on the bench).
+				if (SweepNoReverse)
+				{
+					float wNr = (SweepNoReverseHeld ? 1f : stickRelW) * (1f - sweepHoldDbg);
+					upRate = Mathf.Lerp(upRate, Mathf.Max(upRate, 0f - num8), wNr);
+					dnRate = Mathf.Lerp(dnRate, Mathf.Max(dnRate, num8), wNr);
+				}
+				float capY = num8 + upRate;
+				float capLo = num8 - dnRate;
+				if (num34 > capY)
+				{
+					yawSatPitchDbg = num34 - capY;
+					num34 = capY;
+				}
+				else if (num34 < capLo)
+				{
+					yawSatPitchDbg = num34 - capLo;
+					num34 = capLo;
+				}
+				yawSatCapQ = capY;
+				yawSatCapQLo = capLo;
+				yawSatCapOn = true;
+			}
+			else if (planOwns)
+			{
+				// 2.36.0: the plan owns the nose-down pitch; the caps re-arm from open when it ends (no stale bound at the bottom)
+				yawSatCapQ = 120f;
+				yawSatCapQLo = -120f;
+				yawSatCapOn = false;
+			}
+			else if (yawSatCapOn && !(PushPlan && pushPlanOn))
+			{
+				// let go over GovCapTau, not in one frame
+				yawSatCapQ = Mathf.Lerp(yawSatCapQ, 120f, Mathf.Clamp01(dt / Mathf.Max(0.02f, GovCapTau)));
+				yawSatCapQLo = Mathf.Lerp(yawSatCapQLo, -120f, Mathf.Clamp01(dt / Mathf.Max(0.02f, GovCapTau)));
+				num34 = Mathf.Clamp(num34, yawSatCapQLo, yawSatCapQ);
+				if (yawSatCapQ > 100f)
+				{
+					yawSatCapOn = false;
+				}
+			}
+			// 2.35.0 (PushPlan): the planned push - the nose-down body rate is bounded at the plan's, one curve
+			if (PushPlan && pushPlanOn && !prot && !isAI)
+			{
+				if (pushPlanSide > 0f) num34 = Mathf.Max(num34, 0f - pushPlanQNow);
+				else num34 = Mathf.Min(num34, pushPlanQNow);
+			}
+			// 2.36.0 (PushPlanClipKey): "the sweep toward zero is held back" - the allocator's pitch priority (pitchNeedDn) and the stabs'
+			// attached window (sweepHoldWin) read it next tick - is whatever bounds the push: the sweep caps, or the plan when it is on.
+			// Until 2.35.3 only the caps' clip was read, so under a plan those two ran only because the 60 deg/s ceiling also clipped
+			// the stick (a full push always does) - the ceiling could not stand aside without taking them with it (2.35.1: sideslip
+			// median 4.8 -> 11.2 with PushPlanOwnsPitch).
+			sweepClipDbg = yawSatPitchDbg;
+			sweepClipOn = yawSatCapOn;
+			if (PushPlanClipKey && PushPlan && pushPlanOn && !prot && !isAI)
+			{
+				sweepClipDbg = num34Ask - num34;
+				sweepClipOn = true;
+			}
+			// 2.5.1 (RollGovernorReplaces >= 1): the trade is the rolling-pull protection on its own - the AoA-rise hold above is off, so
+			// the trade no longer waits for it: no IAS fade (the hold's own reaction covered low IAS before), and its slow release
+			// while the stick still asks (PullTradeRiseHold) is kept here
+			// 2.6.0: level 3 only - the trade is the rolling-pull protection on its own, at every IAS and either AoA sign
+			// 2.5.5: both ways and at either AoA sign. A nose-down sweep (push-over under a roll) or a pull from negative AoA moves
+			// the yaw the roll needs just as a pull does, and the roll is what is traded first; the AoA-rate caps then only have the
+			// roll that is left to contend with. 10:10 log, 268 / 315 s: full push + full roll from +9 deg at 104 / 68 m/s - no trade
+			// (pullTrade 139-154 against pSmax 119), the sweep cap took 15-50 deg/s off the pitch-rate command instead, and the pace
+			// window cut the roll a second later anyway.
+			if (Plugin.PullRollTrade > 0f && PullTradeFFK > 0f && SweepPosPullFree && flag && !prot && !isAI && tas > 25f && LatGovMode)
+			{
+				float aAskF = qSweepAsk ? Mathf.Abs(qAskPre - num8) : 0f;
+				pullTradeHoldDbg = aAskF > 5f;
+				pullTradeAsk = aAskF;
 				if (aAskF > 5f)
 				{
 					float caF = Mathf.Abs(Mathf.Cos(alpha * (MathF.PI / 180f)));
 					// faded in with IAS (PullTradeFFIas0 -> +PullTradeFFIasSpan m/s, 180 -> 230 kt; 2.2.12, was 230 -> 280: 13 deg of sideslip at 240 kt in the 10:53 log): below that the governor's own reaction keeps up
 					// with the roll build (your 0.7 / 9 setting held at 250 kt and below)
-					float wIasF = Mathf.Clamp01((ias - PullTradeFFIas0) / Mathf.Max(1f, PullTradeFFIasSpan));
-					float tgtF = (wIasF <= 0f) ? 999f : Mathf.Max(PullTradeFloor, PullTradeFFK * SweepPosK * (PullFFBoostTradeFF ? pullFFBoost : 1f) * (Plugin.PullSideslipMargin / 6f) * aYaw * caF * 57.29578f / aAskF);
-					tgtF = Mathf.Lerp(999f, tgtF, wIasF);
+					float tgtF = 999f;
+					// 2.8.0: the yaw the pair needs grows at pS cos AoA x AoA rate. Against the roll the stick asks (pSAskStick, before
+					// any cap) and the measured capacity on the side the sweep needs (CapacityEstimator, last tick), TradeCapShare of it:
+					// no shortfall, no trade - the pitch runs free whatever the roll limit is doing; a shortfall is split PullRollTrade to
+					// the roll (its target drops until its share is paid) and the rest to the AoA rate. Nothing here reads the roll limit,
+					// so a released stick (pSAskStick 0) asks nothing of the pitch.
+					float kDem = caF * aAskF * (MathF.PI / 180f);
+					float growM = ((qAskPre - num8) * Mathf.Sign(alpha) >= 0f) ? 1f : -1f;
+					float rollRef = (Mathf.Abs(pTraj.x) > 2f) ? pTraj.x : paceTgtRaw;
+					float sideM = growM * Mathf.Sign(rollRef * Mathf.Sin(alpha * (MathF.PI / 180f)));
+					// 2.21.0: the low-passed read (TradeCapTau) - the trade
+					// is the one accounting of the rolling pull's pitch share and must not dip with the rudders' servo transit (see CapacityEstimator)
+					float capM = (sideM >= 0f) ? capEst.capTrZeP : capEst.capTrZeN;
+					float capS = Mathf.Max(0f, TradeCapShare * capM);
+					float demandM = pSAskStick * kDem;
+					if (demandM > capS && kDem > 1E-04f)
+					{
+						float shortM = demandM - capS;
+						float trM = (yawHealth >= 0.99f) ? Plugin.PullRollTrade : Mathf.Min(Plugin.PullRollTrade, PullRollTradeFinLoss);
+						float pSNew = Mathf.Max(PullTradeFloor, pSAskStick - trM * shortM / kDem);
+						float leftM = pSNew * kDem - capS;
+						float aNew = (leftM > 0f && pSNew > 1f) ? (aAskF - leftM / (pSNew * caF * (MathF.PI / 180f))) : aAskF;
+						tgtF = pSNew;
+						tradeAlphaNew = Mathf.Max(StopSlipPitchFloor, aNew);
+					}
+					else
+					{
+						tgtF = 999f;
+					}
 					if (tgtF < pullTradeTgt)
 					{
 						float pSF = Mathf.Abs((omega.x * caF + omega.z * Mathf.Sin(alpha * (MathF.PI / 180f))) * 57.29578f);
@@ -7216,7 +8711,7 @@ namespace Revoker_FS12.FCS
 						// the AoA rise and the roll together (20 Oct 01:41 log, 230-260 kt, rolling 175-210 deg/s: pitch rate
 						// 35 -> 22-31 -> 48 deg/s, sideslip 6-8 deg). At low AoA a velocity-vector roll is nearly a body roll, so
 						// slowing it does not swing the sideslip the way it did at 35 deg AoA.
-						float cutW = (PullTradeCutA > 0f) ? Mathf.Clamp01((PullTradeCutA + 10f - alpha) / 10f) : 0f;
+						float cutW = (PullTradeCutA > 0f) ? Mathf.Clamp01((PullTradeCutA + 10f - Mathf.Abs(alpha)) / 10f) : 0f;
 						tgtF = Mathf.Max(tgtF, Mathf.Lerp(Mathf.Min(pSF, pullTradePs), tgtF, cutW));
 						if (pullTradePs > Mathf.Max(pSF, tgtF))
 						{
@@ -7237,15 +8732,6 @@ namespace Revoker_FS12.FCS
 				slipGovPullDbg = 1f;
 				// 2.2.20: when the governor stops acting (roll under SlipGovPs0, AoA through zero) its cap is let go over
 				// GovCapTau instead of at once, so an unload does not snap back to the stick's 48 deg/s in one frame
-				if (UnloadFadeFix && govCapOn && Plugin.PullGovSmooth && GovCapTau > 0f)
-				{
-					govCapQ = Mathf.Lerp(govCapQ, 120f, Mathf.Clamp01(dt / GovCapTau));
-					num34 = Mathf.Min(num34, govCapQ);
-					if (govCapQ > 100f)
-					{
-						govCapOn = false;
-					}
-				}
 			}
 			pullTradePs = Mathf.MoveTowards(pullTradePs, pullTradeTgt, ((pullTradeTgt < pullTradePs) ? PullTradeFall : ((pullTradeHoldDbg && PullTradeRiseHold > 0f) ? PullTradeRiseHold : PullTradeRise)) * dt);
 			if (pullTradeTgt >= 999f && pullTradePs > 400f)
@@ -7528,6 +9014,14 @@ namespace Revoker_FS12.FCS
 		internal static float EngOutTightenK = 4f;
 
 		internal static float YawTargetMargin = 1f;
+
+		// 2.20.0: the yaw-target clamp's reach includes the stabilators' yaw range while they are off the pitch
+		// (stabPitchFrac below YawClampStabFree, scaled to 0 at it)
+		internal static bool YawClampStabReach = true;
+
+		internal static float YawClampStabFree = 0.25f;
+
+		public float yawClampStabDbg;
 
 		public bool engOut;
 
@@ -8343,6 +9837,65 @@ namespace Revoker_FS12.FCS
 			return 1f - 2f * x;
 		}
 
+		// 2.35.0 (PushPlan, see the statics): plan the push once at its start; hold; let it rise only
+		private void PushPlanStep(float dt, float cA, float sA, float num11Stick)
+		{
+			// (fins damaged: the plan's IAS-based shed does not hold - the 2.19.0 nose hold and the governor pace the push instead)
+			if (!PushPlan || isAI || tas < 40f || yawHealth < 0.99f)
+			{
+				pushPlanOn = false;
+				return;
+			}
+			float aAbs = Mathf.Abs(alpha);
+			float sgA = (alpha >= 0f) ? 1f : -1f;
+			bool pushing = sgA * sp < -0.3f;
+			float rDeg = Mathf.Abs(omega.z * 57.29578f);
+			float capPlan = Mathf.Clamp(PushPlanK0 + PushPlanK * Mathf.Pow(Mathf.Max(1f, ias), PushPlanExp), 6f, 80f);
+			float rLeft = Mathf.Sqrt(2f * capPlan * Mathf.Max(0f, (PushPlanSlip < 0f) ? Plugin.PushoverSideslip : PushPlanSlip));
+			float wv = Mathf.Max(0f, sgA * omegaV);
+			if (!pushPlanOn)
+			{
+				if (pushing && aAbs > PushPlanA0 && rDeg > PushPlanR0)   // a push-over OF a rotation (push + roll entered together is the trade's)
+				{
+					pushPlanOn = true;
+					pushPlanSide = sgA;
+					float T0 = Mathf.Max(PushPlanTMin, Mathf.Max(0f, rDeg - rLeft) / capPlan);
+					pushPlanT = T0;
+					pushPlanQ = Mathf.Clamp(Mathf.Max(0f, aAbs - 10f) / T0 - PushPlanWvK * wv, PushPlanQMin, 60f);
+					// 2.40.0: the 2.35.1 clamp under the sweep's AoA-rate ceiling is gone. It kept the plan 15 deg/s under the 60 deg/s ceiling
+					// so the ceiling would not cut it mid-push; since 2.36.0 the ceiling stands aside under a plan (PushPlanOwnsPitch), and the
+					// clamp only limited speed - the plan's own yaw model sets it now. Hybrid replays, the 20 pushes it bound: 10 deg AoA reached
+					// 0.05-0.23 s sooner, sideslip +0..+2.6 deg (worst push unchanged, 8.3), the re-attach overshoot mostly smaller (23:10 70.4 s
+					// 24.5 -> 3.5 deg/s: the plan now matches the jet's own pitch-down).
+					pushPlanQNow = Mathf.Max(0f, -sgA * qCmd);
+					pushPlanBleed = Mathf.Abs(pTraj.x) / T0;
+					float pTEnd = (stickRelW > 0.5f || num11Stick * pTraj.x <= 0f) ? 0f : Mathf.Min(Mathf.Abs(num11Stick), Mathf.Abs(pTraj.x));
+					pushPlanD = Mathf.Max(capPlan, (Mathf.Abs(pTraj.x) * Mathf.Abs(sA) - pTEnd * 0.17364818f) / T0);
+				}
+				return;
+			}
+			// end: the stick no longer pushes or the AoA changed side; below 10 deg the bound ramps out at PushPlanRelease (no kick at the
+			// bottom) and lets go once it is above anything the stick can ask
+			// 2.40.0 (2.36-dev's PushPlanEndAtBottom, now always): only the bottom's ramp-out ends it - a plan whose rate is the stick's full 60 deg/s mid-push is
+			// still the plan (the yaw allows the full rate); ending there handed the push to the governor's caps mid-sweep (-60 -> -51)
+			if (!pushing || sgA != pushPlanSide || (pushPlanQNow >= 60f && aAbs < 10f))
+			{
+				pushPlanOn = false;
+				return;
+			}
+			if (aAbs < 10f)
+			{
+				pushPlanQ = 60f;
+				pushPlanQNow = Mathf.MoveTowards(pushPlanQNow, 60f, PushPlanRelease * dt);
+				return;
+			}
+			// rise only: what the yaw left now would allow, approached at PushPlanRise
+			float Tn = Mathf.Max(0.2f, Mathf.Max(0f, rDeg - rLeft) / capPlan);
+			float qNeed = Mathf.Clamp(Mathf.Max(0f, aAbs - 10f) / Tn - PushPlanWvK * wv, PushPlanQMin, 60f);
+			if (qNeed > pushPlanQ) pushPlanQ = Mathf.Min(qNeed, pushPlanQ + PushPlanRise * dt);
+			pushPlanQNow = Mathf.MoveTowards(pushPlanQNow, pushPlanQ, PushPlanJerk * dt);
+		}
+
 		private void LateralLaw(float dt)
 		{
 			float f = alpha * (MathF.PI / 180f);
@@ -8466,15 +10019,20 @@ namespace Revoker_FS12.FCS
 				}
 			}
 			sharedLatDbg = yawLeft;
-			if (DamageLatLimit && Mathf.Min(yawHealth, yawLeft) < 0.999f)
+			// 2.12.0: the fin-health factor fades with the rudders (rudderAuth, 50 -> 60 deg AoA): past the fade the fins are not the
+			// yaw axis, so losing them takes nothing away there - the stabs, flaperons and the airframe's own balance carry the
+			// velocity-vector roll, and the measured capacity says so (18:32 log, both fins gone: capZ 38 at 50-65 deg against 39 with
+			// fins; 29-33 against 125-147 at 15-40 deg). Un-faded, rMax x 0.35 capped the corkscrew at 24 deg/s of yaw = 28 deg/s of
+			// velocity roll at 65 deg with the margin untouched (sideslip 2-6 deg) - Tom: "isn't that when the rudders can't really
+			// do any yaw, so why is it capped". Below the fade the open-loop factor stays until the rate cap's reversal probe
+			// carries the roll demand (18:08 log, 541 s: capZ 99 -> 5-23 once a no-fin reversal loaded the flaperons: 17.6 deg).
+			// The asymmetric-load share (yawLeft) is already rudderAuth-aware and is not faded.
+			float finH = Mathf.Lerp(1f, yawHealth, Mathf.Clamp01(rudderAuth));
+			if (DamageLatLimit && Mathf.Min(finH, yawLeft) < 0.999f)
 			{
-				// Revoker 0.1.0: with the vertical tail damaged and the nozzle unable to yaw (above the vectoring speed, low
-				// thrust or engine out), only drag yaw is left (crossed flaperon + canards, ~7 deg/s^2 at 500 km/h): the finless
-				// airframe diverges once the sideslip passes ~1 deg. The damaged roll-rate floor drops to DamageLatFloorNoTvc
-				// there (bench, fins gone, full roll at 900 km/h: floor 0.35 -> 87 deg/s, sideslip ran to 72 deg; 0.15 -> 37
-				// deg/s, 0.2 deg).
+				// Revoker 0.1.0: with the vertical tail damaged and the nozzle unable to yaw only drag yaw is left (see DamageLatFloorNoTvc)
 				float floorK = (tvcy != null && !tvcy.active && yawHealth < 0.5f) ? Mathf.Min(DamageLatFloor, DamageLatFloorNoTvc) : DamageLatFloor;
-				float hK = Mathf.Max(floorK, Mathf.Min(yawHealth, yawLeft));
+				float hK = Mathf.Max(floorK, Mathf.Min(finH, yawLeft));
 				num3 = Mathf.Max(30f * hK, num3 * hK);
 				num8 *= hK;
 				pMaxDbg = num3;
@@ -8512,63 +10070,107 @@ namespace Revoker_FS12.FCS
 			// stick's roll command passes through zero rather than jumping.
 			float revS = Plugin.RevFlowRollSense ? RevFlowSense(alpha) : 1f;
 			revSenseDbg = revS;
-			float num11 = Mathf.Clamp(revS * (sr + num9 * sy), -1f, 1f) * num10;
+			float num11raw = Mathf.Clamp(revS * (sr + num9 * sy), -1f, 1f);
+			// 2.16.0: a rate LIMIT bounds the rotation the stick may build; it may not cut a rotation the jet already has faster than
+			// the yaw can shed it. With the stick on the rotation's side the limit is floored at the velocity roll the body yaw
+			// implies (r / sin AoA: the coordinated roll for the yaw the jet has), which decays as the yaw brakes - the roll follows the
+			// yaw down instead of braking away from it. 20:19 log (both fins gone), held push-over from 62 deg: as the AoA crossed the
+			// rudder fade the fin-health factor took pSmax 61 -> 16, the trajectory braked at the tuned rate, p -28 -> -13 against a
+			// yaw of -47 that needed -42 to stay coordinated, sideslip +20 deg/s, departure (and the bench twin, dmgsuite 'pushover
+			// HELD', the same chain). The stick scales the target as always (easing off is the pilot's deceleration; a release is the
+			// window's job); sin AoA floored at LatFloorSinMin so a low-AoA turn's yaw is not read as a rotation.
+			latFloorDbg = 0f;
+			pSStickRaw = Mathf.Abs(num11raw) * num10;   // 2.18.0: the stick's own target before the floor (the shed cap's credit)
+			stickRelW = Mathf.Clamp01(1f - Mathf.Abs(num11raw) / Mathf.Max(0.02f, SweepNoReverseStick));   // 2.24.0: 1 = lateral stick released
+			float finKL = Mathf.Clamp01(yawHealth / 0.5f);
+			if (LatLimitYawFloor)
+			{
+				float sinF = ((num2 >= 0f) ? 1f : -1f) * Mathf.Max(Mathf.Abs(num2), LatFloorSinMin);
+				float pSyaw = omega.z * 57.29578f / sinF;
+				if (Mathf.Abs(num11raw) > 0.05f)
+				{
+					if (num11raw * pSyaw > 0f)
+					{
+						float fl = Mathf.Abs(pSyaw);
+						if (fl > num10)
+						{
+							latFloorDbg = fl - num10;
+							num10 = fl;
+						}
+					}
+				}
+				else if (ReleaseCoordinate && finKL < 1f && yawSatAlphaRateDn >= 0f && alphaDot * alpha < 0f && Mathf.Abs(pSyaw) > 5f)
+				{
+					// 2.18.0: stick released under a capped nose-down sweep with the fins gone: the roll stays coordinated with the yaw
+					// the jet has (target = r / sin AoA, decaying as the yaw sheds) instead of going to zero while 20-30 deg/s of yaw is
+					// still on (23:49 log, 122 s: roll target 9 -> 0 in 1.5 s, r 29 -> 22, sideslip -1 -> -53 deg). With the fins the
+					// rudders shed the yaw in tenths and the stop stands as it is (finK 1: off).
+					float fl = Mathf.Abs(pSyaw) * (1f - finKL);
+					num10 = Mathf.Max(num10, fl);
+					num11raw = ((pSyaw >= 0f) ? 1f : -1f) * Mathf.Min(1f, fl / Mathf.Max(1f, num10));
+					latFloorDbg = fl;
+				}
+			}
+			float num11 = num11raw * num10;
+			pSAskStick = Mathf.Abs(num11);
 			coupRollLim = 0f;
 			if (Plugin.CouplingRollLimit > 0f && Ia[1, 1] > 1f && asymValid && tvc.M != null && tvc.N > 1)
 			{
 				float kIc = (Ia[2, 2] - Ia[0, 0]) / Ia[1, 1];
 				float s2c = Mathf.Abs(Mathf.Sin(2f * f));
-				float gateC = Mathf.Max(pitchNeed, Mathf.Clamp01((Mathf.Sign(alpha) * alphaDot - 5f) / 15f)) * Mathf.Clamp01((Mathf.Abs(alpha) - CoupGateA0) / 10f);
-				// 2.1.3: at the low-thrust AoA cap the gate stays on within LowCapCoupBand of the cap instead of waiting for the
-				// AoA to rise: with the nozzles pinned and weak, the inertial pitch-up of the roll took the jet 2 deg past the cap,
-				// pitch priority took the stabs back and the roll was cut and restored in a cycle.
-				if (LowCapLatFix && Plugin.LowCapRollFix && LowThrustCapOn && alpha > 0f)
 				{
-					gateC = Mathf.Max(gateC, Mathf.Clamp01((alpha - (authCapEff - LowCapCoupBand)) / Mathf.Max(0.5f, LowCapCoupBand)));
-				}
-				gateC = Mathf.Max(gateC, (Plugin.AsymRollCoupling ? CoupHeldGate : 0f) * Mathf.Clamp01((Mathf.Abs(alpha) - 4f) / 4f) * Mathf.Clamp01((Mathf.Abs(asymDy) - CoupHeldDy0) / CoupHeldDySpan));
-				// 2.1.10: at any AoA limit (not only the low-thrust cap) the gate stays on within CoupLimBand of the limit, and it
-				// comes off over CoupGateRelease s instead of at once. It used to follow pitchNeed, which flips 0 <-> 1 as the pitch
-				// error comes and goes: the roll limit switched off and on every ~0.6 s, the roll rate (and its inertial pitch-up)
-				// jumped 60 <-> 110 deg/s, the nozzles went stop to stop and the pitch rate bounced (13 Oct logs, 45 deg limit,
-				// 89-97 s: q 0..62 deg/s, AoA 39..52).
-				if (CoupGateAtLimit && Plugin.CoupGateAtLimitOn)
-				{
-					float limU = Mathf.Min(Plugin.AoAPos, Mathf.Min(authCapEff, asymCapPosEff));
-					float limD = Mathf.Max(Plugin.AoANeg, authCapNegEff);
-					float nearLim = (alpha >= 0f) ? Mathf.Clamp01((alpha - (limU - CoupLimBand)) / Mathf.Max(0.5f, CoupLimBand)) : Mathf.Clamp01(((limD + CoupLimBand) - alpha) / Mathf.Max(0.5f, CoupLimBand));
-					// only while the pilot holds the jet at the limit (stick toward it)
-					nearLim *= Mathf.Clamp01(((alpha >= 0f) ? sp : (0f - sp)) / 0.5f);
-					gateC = Mathf.Max(gateC, nearLim);
-					// 2.2.2 (LoadedRollSteady, off by default): in a loaded roll (stick toward the AoA side, lateral held, AoA past
-					// the gate start) the coupling roll limit stays on instead of following pitchNeed, and the roll governor judges
-					// the nozzles' margin as it is, not projected 0.3 s ahead (their slew alone made the projection hit zero). 13 Oct
-					// 11:08 log, full aft + full roll from 690 km/h: both switched every ~0.45 s, roll target 98 <-> 172 deg/s,
-					// nozzles stop to stop, pitch rate 15..50, AoA 41..48 at the limit.
-					float gLoaded = Plugin.LoadedRollSteadyOn ? 1f : CoupGateLoaded;
-					if (gLoaded > 0f)
+					float gateC = Mathf.Max(pitchNeedUp, Mathf.Clamp01((Mathf.Sign(alpha) * alphaDot - 5f) / 15f)) * Mathf.Clamp01((Mathf.Abs(alpha) - CoupGateA0) / 10f);
+					// 2.1.3: at the low-thrust AoA cap the gate stays on within LowCapCoupBand of the cap instead of waiting for the
+					// AoA to rise: with the nozzles pinned and weak, the inertial pitch-up of the roll took the jet 2 deg past the cap,
+					// pitch priority took the stabs back and the roll was cut and restored in a cycle.
+					if (LowCapLatFix && Plugin.LowCapRollFix && LowThrustCapOn && alpha > 0f)
 					{
-						float loadedC = Mathf.Clamp01(((alpha >= 0f) ? sp : (0f - sp)) / 0.5f) * Mathf.Clamp01((Mathf.Abs(sr) - 0.05f) / 0.2f) * Mathf.Clamp01((Mathf.Abs(alpha) - CoupGateA0) / 10f);
-						gateC = Mathf.Max(gateC, gLoaded * loadedC);
+						gateC = Mathf.Max(gateC, Mathf.Clamp01((alpha - (authCapEff - LowCapCoupBand)) / Mathf.Max(0.5f, LowCapCoupBand)));
 					}
-					coupGateHeld = Mathf.Max(gateC, coupGateHeld - dt / Mathf.Max(0.05f, CoupGateRelease));
-					gateC = coupGateHeld;
-				}
-				if (gateC > 0.001f && s2c > 0.05f && kIc > 0.01f)
-				{
-					float tvLoC = float.MaxValue;
-					float tvHiC = float.MinValue;
-					for (int tvK = 0; tvK < tvc.N; tvK++)
+					gateC = Mathf.Max(gateC, (Plugin.AsymRollCoupling ? CoupHeldGate : 0f) * Mathf.Clamp01((Mathf.Abs(alpha) - 4f) / 4f) * Mathf.Clamp01((Mathf.Abs(asymDy) - CoupHeldDy0) / CoupHeldDySpan));
+					// 2.1.10: at any AoA limit (not only the low-thrust cap) the gate stays on within CoupLimBand of the limit, and it
+					// comes off over CoupGateRelease s instead of at once. It used to follow pitchNeed, which flips 0 <-> 1 as the pitch
+					// error comes and goes: the roll limit switched off and on every ~0.6 s, the roll rate (and its inertial pitch-up)
+					// jumped 60 <-> 110 deg/s, the nozzles went stop to stop and the pitch rate bounced (13 Oct logs, 45 deg limit,
+					// 89-97 s: q 0..62 deg/s, AoA 39..52).
+					if (CoupGateAtLimit && Plugin.CoupGateAtLimitOn)
 					{
-						tvLoC = Mathf.Min(tvLoC, tvc.M[tvK].y);
-						tvHiC = Mathf.Max(tvHiC, tvc.M[tvK].y);
+						float limU = Mathf.Min(Plugin.AoAPos, Mathf.Min(authCapEff, asymCapPosEff));
+						float limD = Mathf.Max(Plugin.AoANeg, authCapNegEff);
+						float nearLim = (alpha >= 0f) ? Mathf.Clamp01((alpha - (limU - CoupLimBand)) / Mathf.Max(0.5f, CoupLimBand)) : Mathf.Clamp01(((limD + CoupLimBand) - alpha) / Mathf.Max(0.5f, CoupLimBand));
+						// only while the pilot holds the jet at the limit (stick toward it)
+						nearLim *= Mathf.Clamp01(((alpha >= 0f) ? sp : (0f - sp)) / 0.5f);
+						gateC = Mathf.Max(gateC, nearLim);
+						// 2.2.2 (LoadedRollSteady, off by default): in a loaded roll (stick toward the AoA side, lateral held, AoA past
+						// the gate start) the coupling roll limit stays on instead of following pitchNeed, and the roll governor judges
+						// the nozzles' margin as it is, not projected 0.3 s ahead (their slew alone made the projection hit zero). 13 Oct
+						// 11:08 log, full aft + full roll from 690 km/h: both switched every ~0.45 s, roll target 98 <-> 172 deg/s,
+						// nozzles stop to stop, pitch rate 15..50, AoA 41..48 at the limit.
+						float gLoaded = Plugin.LoadedRollSteadyOn ? 1f : CoupGateLoaded;
+						if (gLoaded > 0f)
+						{
+							float loadedC = Mathf.Clamp01(((alpha >= 0f) ? sp : (0f - sp)) / 0.5f) * Mathf.Clamp01((Mathf.Abs(sr) - 0.05f) / 0.2f) * Mathf.Clamp01((Mathf.Abs(alpha) - CoupGateA0) / 10f);
+							gateC = Mathf.Max(gateC, gLoaded * loadedC);
+						}
+						coupGateHeld = Mathf.Max(gateC, coupGateHeld - dt / Mathf.Max(0.05f, CoupGateRelease));
+						gateC = coupGateHeld;
 					}
-					float netC = ((alpha >= 0f) ? (0f - (AsymCap.Interp(asymAlphas, asymNetDn, asymAlphas.Length, alpha) + (tvc.active ? (tvLoC * IaInv[1, 1] * 57.29578f) : 0f))) : (AsymCap.Interp(asymAlphas, asymNetUp, asymAlphas.Length, alpha) + (tvc.active ? (tvHiC * IaInv[1, 1] * 57.29578f) : 0f)));
-					float aAvC = Mathf.Max(CoupRollFloor, Plugin.CouplingRollLimit * netC) * (MathF.PI / 180f);
-					float pLimC = Mathf.Sqrt(2f * aAvC / (kIc * s2c)) * 57.29578f;
-					coupRollLim = pLimC;
-					num10 = Mathf.Lerp(num10, Mathf.Min(num10, pLimC), gateC);
-					num11 = Mathf.Clamp(num11, 0f - num10, num10);
+					if (gateC > 0.001f && s2c > 0.05f && kIc > 0.01f)
+					{
+						float tvLoC = float.MaxValue;
+						float tvHiC = float.MinValue;
+						for (int tvK = 0; tvK < tvc.N; tvK++)
+						{
+							tvLoC = Mathf.Min(tvLoC, tvc.M[tvK].y);
+							tvHiC = Mathf.Max(tvHiC, tvc.M[tvK].y);
+						}
+						float netC = ((alpha >= 0f) ? (0f - (AsymCap.Interp(asymAlphas, asymNetDn, asymAlphas.Length, alpha) + (tvc.active ? (tvLoC * IaInv[1, 1] * 57.29578f) : 0f))) : (AsymCap.Interp(asymAlphas, asymNetUp, asymAlphas.Length, alpha) + (tvc.active ? (tvHiC * IaInv[1, 1] * 57.29578f) : 0f)));
+						float aAvC = Mathf.Max(CoupRollFloor, Plugin.CouplingRollLimit * netC) * (MathF.PI / 180f);
+						float pLimC = Mathf.Sqrt(2f * aAvC / (kIc * s2c)) * 57.29578f;
+						coupRollLim = pLimC;
+						num10 = Mathf.Lerp(num10, Mathf.Min(num10, pLimC), gateC);
+						num11 = Mathf.Clamp(num11, 0f - num10, num10);
+					}
 				}
 			}
 			if (AsymRollMax > 0f && (!AsymRollHardOnly || aRollGo < aRollStop))
@@ -8597,10 +10199,231 @@ namespace Revoker_FS12.FCS
 				// 2.2.26: with a fin lost the trade stays at most PullRollTradeFinLoss (bench, both fins gone, full aft + full
 				// roll at 243 kt: the full trade let the AoA reach the 40 deg cap and the sideslip went 16 -> 23 deg)
 				float trK = (yawHealth >= 0.99f) ? Plugin.PullRollTrade : Mathf.Min(Plugin.PullRollTrade, PullRollTradeFinLoss);
-				float trLim = Mathf.Lerp(num10, Mathf.Max(PullTradeFloor, pullTradePs), trK);
+				float trLim = Mathf.Min(num10, Mathf.Max(PullTradeFloor, pullTradePs));
 				pullTradeDbg = trLim;
+				// 2.6.4: the pitch covers what the roll's share leaves (see pullTradeAsk)
+				tradeAlphaRate = -1f;
+				// 2.7.4: in measured mode the pitch's share is the measured AoA-rise cap below (capacity less the roll's build); this
+				// second cap waited for the roll to slew down before letting the pull through (11:30 log, 112.7 / 167.8 s: qCmd 24 -> 12
+				// -> 44 on a re-pull with the roll still at 60-190 deg/s - the hitch)
+				// (2.7.4 tried it off in measured mode: 13-17 deg on pull + roll reversals on the bench, AoA overshoots; it stays)
+				// 2.8.0: the pitch share is what the measured trade computed from the asked roll, not the limit's slew
+				tradeAlphaRate = (pullTradeHoldDbg && tradeAlphaNew > 0f) ? tradeAlphaNew : -1f;
 				num10 = Mathf.Min(num10, trLim);
 				num11 = Mathf.Clamp(num11, 0f - num10, num10);
+			}
+			else
+			{
+				tradeAlphaRate = -1f;
+			}
+			// 2.5.0 reference governor on the commanded roll rate (replaces the 2.4.17 cap and the 2.4.18 rudder-load gate).
+			// A velocity-vector roll at AoA carries a body yaw rate of pS sin(AoA); when the roll stops or reverses the wing kills
+			// the body roll in a few tenths of a second while the yaw rate is braked more slowly (rudders slewing across their
+			// travel, then their yaw authority), and the yaw left over turns into sideslip at r cos(AoA). Fitted on the 30 Oct
+			// flight logs (200 stops and reversals, 3-40 deg AoA, 150-420 kt), the sideslip excursion of a stop or reversal is
+			//   |pS| sin(AoA) cos(AoA) x (StopSlipTau0 + StopSlipTau1 x max(0, (L - StopSlipKnee) / (1 - StopSlipKnee)))
+			// with L the rudders' load for the roll's yaw (their yaw moment toward the roll's yaw side over what they have on
+			// that side, StopSlipHoldTau filter). It is linear in the roll rate and did not depend on IAS or on the rudders'
+			// authority in the logs (the 2.4.17 bench model, quadratic in the yaw rate over the rudder authority, held low-IAS
+			// rolls that stop cleanly in game to its 30 deg/s floor). Stops with the rudders at their stop before the release
+			// (14:35 log 267.7 / 271.2 / 273.8 s, 10:28 log 61.8 / 139.3 / 277.1 s: 12-16 deg) are the knee term; stops from
+			// rolls settled with rudder margin were benign at 124-152 deg/s (14:35 log 85.0 / 152.9 s: 1.1 deg).
+			// The governor caps the roll-rate command (not the trajectory's acceleration or braking) to the rate whose
+			// predicted excursion is the margin schedule: RollStopSideslip up to StopSlipAoALo deg AoA, RollStopSideslip50 at 50,
+			// RollStopSideslip65 at 65, off past StopSlipAoAEnd; RollStopSlipGain scales the prediction (1 = the median fit).
+			// Reference-governor dynamics: the cap comes down at StopSlipFallK x aB / sin(AoA) (and rises at StopSlipRiseK times that) - the
+			// roll deceleration the rudders' braking yaw aB could coordinate - so a falling cap is a roll the yaw can follow, not
+			// a stop of its own (2.4.18's gate, engaging over 0.3 s mid-roll, braked the roll with the rudders pinned and made the
+			// sideslip it was meant to prevent: 23:27 log, 96-98 s). While the trajectory is still accelerating into the roll the
+			// cap does not come down: the rudders pin in every fast entry and unpin as the yaw catches up.
+			stopSlipABDbg = 0f;
+			stopSlipMarginDbg = 0f;
+			// 2.5.3: no AoA gate here (was |sin AoA| > 0.05): the AoA-sweep cap below must hold through zero AoA - with the gate
+			// the cap let go for 0.15 s as a push + roll crossed zero and the pitch rate stepped from -24 to -60 deg/s there
+			// (bench, 300 km/h). The margin cap itself is unbounded near zero AoA through sc's floor.
+			if (!isAI && LatGovMode)
+			{
+				float aAbs = Mathf.Abs(alpha);
+				float gS = 1f - Mathf.Clamp01((aAbs - StopSlipAoAEnd) / 5f);
+				float sgnR = (Mathf.Abs(num11) > 2f) ? Mathf.Sign(num11) : ((Mathf.Abs(pTraj.x) > 2f) ? Mathf.Sign(pTraj.x) : 0f);
+				// yaw moment sign that brakes the roll's yaw (the roll's yaw rate is pS sin(AoA))
+				float yB = 0f - sgnR * Mathf.Sign(alpha);
+				float nPos = 0f;
+				float nNeg = 0f;
+				// Revoker 0.3.0: the rudder and the yaw nozzle (yawEffs), each within its usable travel, the rudder faded with the fin
+				CollectYawEffs();
+				float zRudNow = 0f;
+				foreach (YawEff yS in yawEffs)
+				{
+					YawRange(yS, out float zHi, out float zLo);
+					nPos += Mathf.Max(0f, zHi) * yS.auth;
+					nNeg += Mathf.Max(0f, 0f - zLo) * yS.auth;
+					zRudNow += yS.e.MAt(yS.e.now).z * yS.auth;
+				}
+				// Revoker 0.3.1 (from Ifrit 0.6.0): the fin's own restoring yaw is part of the yaw axis - the probe's directional
+				// stiffness k (slipStiff, deg/s^2 per deg, from the airframe's tables at the present flow) over an excursion to the
+				// margin m adds k m / 2 (the reversal model with the weathervane in it peaks at m for dR^2 = (2 a m + k m^2) / c).
+				// Nothing entered: the probe's number and the margin. ~10 % of the rudder + nozzle here.
+				stiffCredit = (PaceStiffCredit > 0f && Plugin.RollStopSlipProbe) ? (PaceStiffCredit * Mathf.Max(0f, slipStiffDbg) * 0.5f * Mathf.Max(1f, stopSlipMarginDbg)) : 0f;
+				yawCapDbg = 0.5f * (nPos + nNeg) * IaInv[2, 2] * 57.29578f + stiffCredit;
+				dampCredit = (PaceDampCredit > 0f && Plugin.RollStopSlipProbe) ? (PaceDampCredit * Mathf.Max(0f, 0f - slipDampF) * 0.5f * Mathf.Abs(omega.z) * 57.29578f) : 0f;
+				float nB = (yB > 0f) ? nPos : ((yB < 0f) ? nNeg : Mathf.Min(nPos, nNeg));
+				// the yaw effectors' load for the roll's yaw: their yaw moment now, toward the roll's yaw side, over what they have there
+				float sY = 0f - yB;
+				float nDrive = (sY > 0f) ? nPos : nNeg;
+				float uR = (sY != 0f && nDrive > 1E-06f) ? Mathf.Clamp01(sY * zRudNow / nDrive) : 0f;
+				stopSlipUDbg = uR;
+				// 2.5.2: the rudders' usage whichever side they are on - after a reversal they are still pinned the old way, and
+				// the yaw axis is just as saturated for the new roll until they have crossed
+				float nAbs = (zRudNow >= 0f) ? nPos : nNeg;
+				float uAbs = (nAbs > 1E-06f) ? Mathf.Clamp01(Mathf.Abs(zRudNow) / nAbs) : 0f;
+				stopSlipAbsF += (uAbs - stopSlipAbsF) * (dt / (StopSlipHoldTau + dt));
+				float aB = Mathf.Max(1f, StopSlipYawUse * nB * IaInv[2, 2] * 57.29578f + stiffCredit);
+				stopSlipABDbg = aB;
+				if (gS > 0f)
+				{
+					// margin schedule
+					float bLo = Plugin.RollStopSideslip;
+					// 2.5.14: one margin at every AoA (RollStopSideslip); the 50 / 65 deg values are no longer read - a schedule by AoA
+					// was the last one in the lateral law, and the fins' stall bound runs the other way and is not what carries the
+					// lateral authority above 35 deg (14:05 analysis). The margin is a handling number; the yaw side is from the tables.
+					float bM = bLo;
+					if (Plugin.RollStopSlipProbe)
+					{
+						bM = Mathf.Max(1f, Mathf.Min(bM, SlipTolUse * slipTolF));
+					}
+					stopSlipMarginDbg = bM;
+					float sc = Mathf.Max(0.02f, Mathf.Abs(num2 * num));
+					// 2.21.0: the 2.5.3 AoA-rise cap ('roll first, then pitch': StopSlipPitchK x (capacity - the roll's own build x sin AoA)
+					// / (pS cos AoA), gated by the rudders' yaw and the sideslip lead) is deleted. It spent the same yaw capacity the trade
+					// had already divided (TradeCapShare, PullRollTrade), a second time and with the roll trajectory's acceleration taken
+					// off it first, so a pull with the roll stick coming in 0.3 s later went 60 -> 24 -> 44 deg/s of pitch command where
+					// the trade's own share read 26-38 (3 Nov 09:53 log, 39.9-40.5 s, 214 kt: rudders to the stop, sideslip 0.1-1.5 deg)
+					// - the pitch hitch. The trade is the one accounting of the sweep's yaw demand on the sweep that grows |AoA|; the
+					// roll's own build is a transient the sideslip margin pays for, not a steady demand (counted as one it is this cap
+					// again: 141 deg/s of roll asked, 40 deg/s^2 of build at 12 deg AoA, 45 of capacity -> 10 deg/s of pitch).
+					yawSatAlphaRate = -1f;
+					yawSatAlphaRateDn = -1f;
+					// 2.5.4: sized from the roll the jet has, not only the reference - when the window drops the reference the body roll
+					// is still 70-120 deg/s for half a second and the sweep under it still needs the yaw (09:44 log, 324 / 328 s: the cap
+					// let go and the push / pull ran at 50-60 deg/s of AoA rate over a 100 deg/s roll, 9-11 deg); and whenever a roll
+					// is in progress, stick held or released (280 s: released mid-roll, cap off, 13.5 deg)
+					float pSNow = Mathf.Abs(omega.x * num + omega.z * num2) * 57.29578f;
+					float pSCap = Mathf.Max(Mathf.Abs(pTraj.x), pSNow);
+					pushGovL = float.NaN;
+					PushPlanStep(dt, num, num2, num11);
+					if (Plugin.RollGovernorPitch && pSCap > 5f)
+					{
+						// 2.34.0 (PushGov, see the static): the sweep that grows |AoA| is the trade's (either AoA sign, held stick; a released
+						// stick asks nothing of it); the sweep toward zero is the governor's push side.
+						float capPullG = StopSlipPitchFree;
+						if (tradeAlphaRate > 0f) capPullG = Mathf.Min(capPullG, tradeAlphaRate);
+						tradeAlphaDbg = (tradeAlphaRate > 0f) ? tradeAlphaRate : 0f;
+						float sG = Mathf.Abs(num2), cG = Mathf.Abs(num);
+						float pSSignedG = omega.x * num + omega.z * num2;
+						float sideG = (Mathf.Abs(pTraj.x) > 2f) ? Mathf.Sign(pTraj.x) : Mathf.Sign(pSSignedG);
+						pushGovSide = sideG;
+						// the yaw that coordinates the rotation is pS sin a: its sign is the side the yaw sheds FROM
+						float rSideG = sideG * Mathf.Sign(num2);
+						// 2.34.1 (PushGovNoStab): the yaw the push will have is the yaw WITHOUT the stabilators - the push itself takes them for pitch
+						// (21:52 log, 149.0 / 189.1 s: stabPitchFrac 0 -> 0.9 by 53 deg, the full read said 30-37 deg/s^2 of shed, 16-20 was delivered
+						// at 50-30 deg; the no-stab read said 14-28). With the fins gone the stabs ARE the yaw (2.22.0's blend): by the fin health.
+						float capYFull = (rSideG > 0f) ? capEst.capZeN : capEst.capZeP;
+						float capYNs = (rSideG > 0f) ? capEst.capZeNsN : capEst.capZeNsP;
+						float capYRaw = PushGovNoStab ? Mathf.Lerp(capYFull, Mathf.Min(capYFull, capYNs), Mathf.Clamp01(yawHealth / 0.5f)) : capYFull;
+						// the body roll pS cos a grows on the rotation's side
+						// (the full-travel read: the discounted one follows the roll loop's own last command - braking, it read 30; growing, 94)
+						float capXRaw = (sideG > 0f) ? capEst.capXPraw : capEst.capXNraw;
+						float kG = dt / (Mathf.Max(0f, PushGovCapTau) + dt);
+						if (!pushGovXInit) { pushGovCapXF = capXRaw; pushGovCapYF = capYRaw; pushGovXInit = true; }
+						pushGovCapXF += (capXRaw - pushGovCapXF) * kG;
+						pushGovCapYF += (capYRaw - pushGovCapYF) * kG;
+						float capYG = Mathf.Max(0f, TradeCapShare * pushGovCapYF);
+						float capXG = Mathf.Max(0f, TradeCapShare * pushGovCapXF);
+						float aCmdG = Mathf.Max(0f, (0f - Mathf.Sign(alpha)) * (qCmd - omegaV));
+						bool actG = aCmdG > 2f && !isAI;
+						// the body roll when the sweep began (frozen while it runs)
+						if (!actG) pushGovP0 = Mathf.Abs(omega.x) * 57.29578f;
+						pushGovActive = actG;
+						// how far the velocity roll may grow: held stick, the stick's own target (never faster than the pilot asks); released,
+						// PushGovRollK x the body roll it had when the sweep began (Tom: "the roll stops, a little slower is fine" - never faster)
+						float growRawG = Mathf.Max(5f, Mathf.Lerp(Mathf.Abs(num11), PushGovRollK * Mathf.Max(10f, pushGovP0) / Mathf.Max(0.2f, cG), stickRelW));
+						if (!actG || pushGovGrowF <= 0f) pushGovGrowF = growRawG;
+						pushGovGrowF += (growRawG - pushGovGrowF) * kG;   // (the same 0.2 s: the stick's target steps as the law's limits move)
+						float growCapG = pushGovGrowF;
+						float pCeilG = growCapG * cG;   // as a body roll
+						pushGovCeil = growCapG; pushGovP0Dbg = pushGovP0;
+						// the roll's growth is credited only while the velocity roll is under that cap
+						float capXAvail = capXG * Mathf.Clamp01((growCapG - Mathf.Abs(pTraj.x)) / Mathf.Max(1f, 0.25f * growCapG));
+						// (2) over the sweep: coordinated with the body roll at its ceiling the yaw is pCeil tan a, so while the yaw is r (less what
+						// PushoverSideslip absorbs at the bottom) the AoA may come no lower than a_min = atan(r_ex / pCeil); a_min falls as the yaw
+						// sheds (at capY: d a_min / dt = capY pCeil / (pCeil^2 + r_ex^2)). The pace closes on a_min over PushGovTau.
+						float rOnG = Mathf.Max(0f, rSideG * omega.z * 57.29578f);
+						float rLeftG = Mathf.Sqrt(2f * capYG * Mathf.Max(0f, PushGovSlipK * Plugin.PushoverSideslip));
+						float rExG = Mathf.Max(0f, rOnG - rLeftG);
+						float aMinG = Mathf.Atan(rExG / Mathf.Max(5f, pCeilG)) * 57.29578f;
+						float gapG = Mathf.Max(0f, Mathf.Abs(alpha) - aMinG);
+						float capTermG = ((PushGovDecel > 0f) ? Mathf.Sqrt(2f * PushGovDecel * gapG) : (gapG / Mathf.Max(0.05f, PushGovTau))) + 57.29578f * capYG * pCeilG / Mathf.Max(1f, pCeilG * pCeilG + rExG * rExG);
+						pushGovAMin = aMinG;
+						// (3) the shed time: the yaw over the allowance has to be gone when the AoA is at zero - |AoA-rate| <= |a| capY / r_ex. When
+						// the yaw sheds as planned, a and r_ex fall together and this is ONE constant rate through the push (rising at the bottom as
+						// r_ex reaches the allowance); r_ex weighted by (1 - cos a) against SweepShedCos (2.6.6: near zero a hold buys nothing)
+						float wShG = Mathf.Clamp01((1f - cG) / Mathf.Max(0.05f, SweepShedCos));
+						float rExW = rExG * wShG;
+						float capShedG = (rExW < 0.5f) ? StopSlipPitchFree : Mathf.Abs(alpha) * capYG / rExW;
+						// The roll's ACCELERATION is never what binds (100-500 deg/s^2 against the yaw's 20-50): what binds is how far it may grow, which
+						// is (2). (1), the one-tick two-axis rate (capY cos a + capX sin a) / pS, was a bench switch (PushGovInst, off; deleted 2.44.1).
+						float capPaceG = Mathf.Min(capShedG, capTermG);
+						float capDnG = Mathf.Max(SweepFloor, capPaceG);
+						// 2.19.0 nose-hold without fins (unchanged)
+						sweepHoldDbg = 0f;
+						float finKcG = Mathf.Clamp01(yawHealth / 0.5f);
+						if (SweepHoldFade && finKcG < 1f)
+						{
+							float rotNowG = Mathf.Abs(pSSignedG) * 57.29578f;
+							float wRG = Mathf.Clamp01((rotNowG - SweepHoldRate) / Mathf.Max(1f, SweepHoldRateBlend));
+							float wSG = Mathf.Clamp01((SweepHoldStabFrac - stabPitchFrac) / Mathf.Max(0.05f, SweepHoldStabFrac));
+							float wHG = (1f - finKcG) * wRG * wSG;
+							capDnG = Mathf.Lerp(capDnG, 0f, wHG);
+							sweepHoldDbg = wHG;
+						}
+						// the sweep that grows |AoA| from negative AoA (a push through zero under a held roll): the trade, and the yaw the rotation
+						// needs on the far side may build no faster than its capacity there allows, SweepYawK x capY(grow) cos a / pS (the 2.1.8
+						// rule for that sweep, unchanged in kind; the roll's share is the trade's)
+						if (alpha < 0f)
+						{
+							float capYGrow = (rSideG > 0f) ? capEst.capTrZeP : capEst.capTrZeN;
+							capPullG = Mathf.Min(capPullG, Mathf.Max(SweepFloor, 57.29578f * SweepYawK * Mathf.Max(0f, capYGrow) * cG / Mathf.Max(5f, pSCap)));
+						}
+						yawSatAlphaRate = capPullG;
+						yawSatAlphaRateDn = Mathf.Min(StopSlipPitchFree, (PushPlan && pushPlanOn) ? StopSlipPitchFree : capDnG);
+						// lateral: with the commanded AoA rate toward zero (this tick's pitch command less the flight path's rotation) the
+						// velocity roll may come down no faster than L, and must grow when L > 0 (applied to the roll trajectory below)
+						pushGovA = aCmdG;
+						if (actG)
+						{
+							pushGovL = (Mathf.Abs(pTraj.x) * cG * aCmdG * (MathF.PI / 180f) - Mathf.Max(0f, pushGovCapYF)) / Mathf.Max(0.05f, sG);
+							// the roll side: the body roll pS cos a grows by pS sin a x AoA-rate at constant pS - the velocity roll may grow by no
+							// more than (capX available - pS sin a AoA-rate) / cos a (negative at the ceiling: it must come down)
+							pushGovU = Mathf.Lerp(1E+06f, (capXAvail - Mathf.Abs(pTraj.x) * sG * aCmdG * (MathF.PI / 180f)) / Mathf.Max(0.2f, cG), stickRelW);
+						}
+						capSweepDbg = Mathf.Min(StopSlipPitchFree, capDnG);
+						capShedDbg = float.IsNaN(pushGovL) ? 0f : Mathf.Clamp(pushGovL, -999f, 999f);
+						aYawShedDbg = capYG;
+						sweepDelF = capXAvail;   // (telemetry 'capSm' under PushGov: the roll growth credited)
+					}
+					else
+					{
+						tradeAlphaDbg = 0f;
+						sweepDelF = 0f;
+						capSweepDbg = 0f;
+						capShedDbg = 0f;
+						aYawShedDbg = 0f;
+						pushGovXInit = false;
+						pushGovActive = false;
+					}
+					num11 = Mathf.Clamp(num11, 0f - num10, num10);
+				}
 			}
 			pSmaxDbg = num10;
 			float num12 = (0f - (1f - num9)) * sy * Plugin.PedalBeta;
@@ -8614,7 +10437,6 @@ namespace Revoker_FS12.FCS
 				num12 = Mathf.Clamp(num12, 0f - pedLim, pedLim);
 			}
 			betaPedalCmd = num12;
-			float num13 = Mathf.Abs(beta - num12);
 			// 2.1.0 sideslip-rate lead: the guard also looks at where the sideslip is heading, from the measured body rates
 			// (kinematic sideslip rate p sin(AoA) - r cos(AoA) plus gravity's g cos(theta) sin(phi) / V). A stability-axis roll
 			// needs a yaw rate of p sin(AoA); when the yaw axis cannot build it (low IAS, an AoA sweep under a roll, fins near
@@ -8625,7 +10447,36 @@ namespace Revoker_FS12.FCS
 			bdk = bdkF.Step(bdk, SlipRateTau, dt);
 			slipRateDbg = bdk;
 			float bErrNow = beta - num12;
-			float bErrLead = bErrNow + bdk * SlipLeadT;
+			// Revoker 0.2.14/0.2.15: the lag the lateral loops answer within, for the sideslip-hold gain (SlipGainFromLoops) and
+			// the governor's look-ahead below. Yaw path: 1/KYaw + the actuator lag; roll path: 1/KRoll + the actuator lag; a path
+			// that would have to deliver the hold's share beyond the spare authority of its axis counts the time that share takes
+			// at the spare authority instead (capped at 1 s); cos^2 / sin^2 weighted by the kinematic split of the correction.
+			{
+				float lagAct = Plugin.ActuatorLagT;
+				latLagYawNom = 1f / Mathf.Max(0.1f, Plugin.KYaw) + lagAct;
+				float lagYaw = latLagYawNom;
+				float lagRoll = 1f / Mathf.Max(0.1f, Plugin.KRoll) + lagAct;
+				float rSprev = rSF.init ? Mathf.Abs(rSF.y) : 0f;
+				float accTraj = Mathf.Abs(pTraj.v);
+				float spareYaw = Mathf.Max(5f, aYaw - accTraj * Mathf.Abs(num2));
+				float spareRoll = Mathf.Max(5f, Mathf.Min(aRollGo, aRollStop) - accTraj * Mathf.Abs(num));
+				lagYaw = Mathf.Min(1f, Mathf.Max(lagYaw, rSprev * Mathf.Abs(num) / spareYaw));
+				lagRoll = Mathf.Min(1f, Mathf.Max(lagRoll, rSprev * Mathf.Abs(num2) / spareRoll));
+				float c2 = num * num;
+				float s2 = num2 * num2;
+				latLagEff = (c2 * lagYaw + s2 * lagRoll) / Mathf.Max(0.01f, c2 + s2);
+			}
+			// Revoker 0.2.15 (SlipGovLeadFromLoops): the governor looks ahead as far as the loops take to answer (latLagEff), not a
+			// fixed 0.8 s. 30 Oct 23:45 log (0.2.14), push + roll at -42 deg AoA: the sideslip crossing zero at +11 deg/s on its
+			// way back from -3.3 (the hold's own recovery, which peaked at +2.4) read as +9 deg 0.8 s out and cut the roll target
+			// 79 -> 46 deg/s; the roll braked at -95 deg/s^2, the yaw command fell 7 deg/s with the yaw nozzle and rudder on their
+			// stops, the yaw rate ran 6 deg/s past it and the nozzle went stop to stop; 0.35 s later the release re-built the
+			// roll 46 -> 85 and the yaw ran the same way again. Over the yaw loop's own 0.33-0.47 s that crossing projects to
+			// 3.6 deg: no cut. The first cut (sideslip -3.3 with -10 deg/s of rate, the yaw axis behind the sweep) goes from
+			// 0.38 to ~0.85 of the roll: the hold is left to take out what the F-22E takes out there (-6.8 deg in one move).
+			float leadT = (Plugin.SlipGainFromLoops && Plugin.SlipGovLeadFromLoops) ? Mathf.Min(SlipLeadT, latLagEff) : SlipLeadT;
+			slipLeadDbg = leadT;
+			float bErrLead = bErrNow + bdk * leadT;
 			float num14 = Mathf.Clamp01((Mathf.Abs(alpha) - 8f) / 10f);
 			// Ifrit 0.3.8: one low-TAS / reversed-flow factor for everything that works off the sideslip or coordinates the
 			// roll with yaw (0.3.7's hold fade, moved up): 1 at speed, 0 below SlipHoldMinTAS or past 120 deg |AoA|.
@@ -8639,8 +10490,14 @@ namespace Revoker_FS12.FCS
 			// on its 10 deg/s floor from 30 m/s: ~11 deg/s for 3+ s with full stick up to 48 m/s.
 			float latLimK = Mathf.Clamp01((tas - Plugin.SlipLimTasMin) / Mathf.Max(1f, Plugin.SlipLimTasSpan));
 			latLimK = latLimK * latLimK * (3f - 2f * latLimK) * latRevK;
-			float x = Mathf.Clamp01(1f - (num13 - Plugin.SideslipGuardStart) / 10f) * (1f - Plugin.YawSatGuard * yawSat * num14);
-			// independent of SideslipGuardStart (which a pilot may raise out of the way for deliberate sideslip): backs the
+			// 2.11.0: the 2.0.15 sideslip guard (SideslipGuardStart: the stick's roll scaled down past 4 deg of sideslip error) and the
+			// yaw-saturation guard (YawSaturationGuard x yawSat) are deleted. 2 Nov, 2.9.x-2.10.0 logs: the sideslip term read 1.0 in
+			// 93-96 % of roll-asked ticks (Tom flew it at 40 = off from 16:37 with the 22-34 deg AoA rolls unchanged: |pS| 70 -> 71,
+			// sideslip p90 5.7 -> 6.4 deg), and the yaw-saturation term only ever cut (x 0.66-0.78) where the pace window was already
+			// holding the target (paceHold > 2 in 67-100 % of those ticks: reversals and stops with the roll near zero). The window is
+			// the saturation guard; the asymmetric-load sideslip lead (slipGov) below still scales x.
+			float x = 1f;
+			// the asymmetric-load sideslip lead: backs the
 			// velocity-vector roll off only while the predicted sideslip error is large AND still growing, so a sideslip that is
 			// already recovering never holds the roll back
 			slipGovDbg = 1f;
@@ -8665,7 +10522,9 @@ namespace Revoker_FS12.FCS
 			// 2.1.2: negative AoA only. Both limiters were for the push + lateral departure; at positive AoA the lateral law
 			// is 2.0.15's again (2.1.0 / 2.1.1 changed the positive-AoA roll feel). Full at AoA <= NegGateA0 - NegGateSpan,
 			// off at AoA >= NegGateA0.
-			float negGate = Mathf.Clamp01((NegGateA0 - alpha) / Mathf.Max(0.5f, NegGateSpan));
+			// 2.6.0: the 2.1.0-2.1.2 push + roll limiters (sideslip-rate lead, yaw anchor) act only for an asymmetric load past the
+			// rudder fade (the damage case, below); the clean jet's push + roll is the governor's
+			float negGate = 0f;
 			// 2.1.4: at positive AoA with an asymmetric load past the rudder fade the same two limiters act: the flaperons are
 			// spent trimming the load's roll, the stabs are the only yaw source and their yaw carries roll that nothing can
 			// cancel, so the roll outruns the yaw it needs (12 Oct 18:29 log: sideslip 10-24 deg at ~50 deg AoA). Clean jets
@@ -8725,26 +10584,722 @@ namespace Revoker_FS12.FCS
 				yawAnchorDbg = (num11 >= 0f) ? hi : lo;
 				num11 = Mathf.Lerp(num11, Mathf.Clamp(num11, lo, hi), negGate * latLimK);
 			}
+			// 2.5.3 yaw-reach (pace) governor (RollGovernorReplaces >= 2): one rule for the pace of every lateral move - the
+			// pair's body-yaw demand, pS sin(AoA) plus the sideslip correction's rS cos(AoA), may not lead the measured yaw
+			// rate by more than the yaw axis can close within PaceHorizon. The reach is what the jet's yaw is doing now
+			// (filtered yaw acceleration x horizon, so a yaw that is already braking opens the window ahead of itself) plus what
+			// the rudders can add within the horizon from where they are (their moment tables, slewed from the present
+			// deflection, at PaceRudderUse), plus PaceFloor for the loop's normal tracking error. The roll-rate target is held
+			// inside that window and the trajectory runs toward it at its tuned acceleration / braking, so where the yaw keeps
+			// up nothing changes and where it does not the roll reference moves at the yaw's own pace. In a coordinated roll
+			// the yaw already matches and the window never binds; in a stop or reversal the roll reference comes down as the
+			// yaw actually brakes instead of at the wing's rate (31 Oct 01:40 log, level 3: 720 deg/s^2 brakes at 22 deg AoA
+			// asked the yaw for 270 deg/s^2 against 85-100 from pinned rudders - 10.5 / 14.2 deg at 195.4 / 198.8 s); with
+			// the stick released at 65 deg AoA it does CoordinatedStop's job (214 s: a 62 deg/s rotation told to stop in
+			// 0.3 s, 15.5 deg for 5 s); at negative AoA it is the 2.1.0 yaw anchor with the reach from the tables and the
+			// measured yaw instead of a constant. It never asks for a roll against the one in progress: when the yaw the jet
+			// has only fits a roll the other way (the AoA swept through zero under a roll), the target is zero - stop, not
+			// reverse. Replaces the trajectory's yaw-coordination caps (RollEntryCoord, BrakeYawCap, RevYawCap, CoordJerk,
+			// CoordinatedStop) at level 3 and the push + roll limiters at level 2.
+			paceLeadDbg = 0f;
+			paceHoldDbg = 0f;
+			rateBlendEffDbg = 0f;
+			paceAccelCap = -1f;
+			paceTgtRaw = num11;
+			paceGateZDbg = 0f;
+			paceGateXDbg = 0f;
+			// 2.35.3: with the lateral stick released in a planned push-over the plan's bleed owns the velocity roll (target 0 at the bleed
+			// rate, set below); the stop window's hold and pacing were computed and then overwritten every tick, so they stand down
+			// Revoker 0.7.0 (PushPlanStopsRoll, Tom 5 Nov 01:10: "slow down the pitch and stop the roll during that pitchdown / AoA transient"): under a
+			// planned push the velocity roll bleeds to zero over the plan's time with the lateral stick held too, not only released. The yaw that
+			// coordinates a held roll is what the push has to shed before zero AoA (r = pS sin AoA); held, the roll kept making it.
+			// 00:59 log, 73.1 s: a -60 deg corkscrew with the stick moved to a positive one, roll held at 70 deg/s, 63 deg/s of yaw on
+			// the yaw shedding at 16 deg/s^2 - 2.2 s from -40 deg to zero and 13 deg of sideslip; 00:23 log 232 / 257 s, 17.6 / 24.6 deg.
+			// The roll comes back to the stick when the plan ends (below 10 deg AoA).
+			bool pushBleed = PushPlan && pushPlanOn && (stickRelW > 0.5f || PushPlanStopsRoll) && Mathf.Abs(pTraj.x) > 0.5f;
+			bool pushHeld = PushPlanHeld && PushPlan && pushPlanOn && !pushBleed && Mathf.Abs(pTraj.x) > 0.5f;
+			bool winDown = pushBleed && PushPlanWinOff;
+			if (winDown)
+			{
+				paceStopNF = 0f;   // (the no-fin stop; inert here: the plan needs both fins)
+			}
+			if (!winDown && !isAI && LatGovMode && tas > 40f && Mathf.Max(Mathf.Abs(num2), Mathf.Abs(Mathf.Sin((alpha + alphaDot * PaceHorizon) * (MathF.PI / 180f)))) > PaceSinMin)
+			{
+				float rM = omega.z * 57.29578f;
+				float rDotRaw = paceInit ? ((omega.z - paceOmegaZPrev) / Mathf.Max(dt, 1E-04f) * 57.29578f) : 0f;
+				float rDot = paceRDotF.Step(rDotRaw, PaceAccelTau, dt);
+				paceRDotLast = rDot;
+				float gPos = 0f;
+				float gNeg = 0f;
+				float nAvPos = 0f;
+				float nAvNeg = 0f;
+				float iz = IaInv[2, 2] * 57.29578f;
+				// Revoker 0.3.0: the rudder and the yaw nozzle (yawEffs), each from where it is at its own slew, faded by its auth
+				CollectYawEffs();
+				foreach (YawEff yP in yawEffs)
+				{
+					Effector seP = yP.e;
+					float zNow = seP.MAt(seP.now).z * yP.auth;
+					float zAtMax = seP.MAt(yP.hi).z * yP.auth;
+					float zAtMin = seP.MAt(yP.lo).z * yP.auth;
+					float rate = Mathf.Max(1f, seP.rate);
+					// yaw the effector can still add toward each side from where it is, no more than one side's worth
+					float nSide = 0.5f * Mathf.Abs(zAtMax - zAtMin);
+					nAvPos += Mathf.Min(nSide, Mathf.Max(0f, Mathf.Max(zAtMax, zAtMin) - zNow));
+					nAvNeg += Mathf.Min(nSide, Mathf.Max(0f, zNow - Mathf.Min(zAtMax, zAtMin)));
+					for (int dirP = -1; dirP <= 1; dirP += 2)
+					{
+						float tgt = ((zAtMax >= zAtMin) == (dirP > 0)) ? yP.hi : yP.lo;
+						float dd = Mathf.Abs(tgt - seP.now);
+						float ts = Mathf.Min(PaceHorizon, dd / rate);
+						float dh = seP.now + Mathf.Sign(tgt - seP.now) * rate * ts;
+						float aS = Mathf.Max(0f, dirP * (seP.MAt(dh).z * yP.auth - zNow)) * iz;
+						// the yaw acceleration ramps with the slew to ts, then holds to the horizon
+						float g = 0.5f * aS * ts + aS * (PaceHorizon - ts);
+						if (dirP > 0)
+						{
+							gPos += g;
+						}
+						else
+						{
+							gNeg += g;
+						}
+					}
+				}
+				// Revoker 0.4.1: the reach over every allocator effector (PaceReachAll)
+				if (PaceReachAll)
+				{
+					ReachAll(out float gPA, out float gNA, out float nPA, out float nNA);
+					gPos = gPA;
+					gNeg = gNA;
+					nAvPos = nPA / Mathf.Max(1E-06f, iz);
+					nAvNeg = nNA / Mathf.Max(1E-06f, iz);
+				}
+				float reachPos = Mathf.Max(0f, rDot * PaceHorizon + PaceRudderUse * gPos) + PaceFloor;
+				float reachNeg = Mathf.Max(0f, 0f - rDot * PaceHorizon + PaceRudderUse * gNeg) + PaceFloor;
+				// 2.6.11 (PaceMarginReach): the sideslip margin still unused is reach too. A yaw-rate lead L that the yaw closes at a
+				// builds L^2 cos(AoA) / (2 a) of sideslip, so the lead whose sideslip stays inside margin - |beta| is
+				// sqrt(2 a (margin - |beta|) / cos AoA), a = PaceYawUse of what the rudders can add toward that side (gPos / gNeg
+				// over the horizon, as a rate) - the same yaw the window already credits. Measured sideslip, so the window holds
+				// only as the margin is actually being used (02 Nov 00:54 log, 340 kt corkscrew entry: roll held 70 -> 17 deg/s at
+				// 45-55 deg AoA with the sideslip at 0.8-2.2 of a 4 deg margin).
+				paceMarginLeadDbg = 0f;
+				if (PaceMarginReach)
+				{
+					float mLeft = Mathf.Max(0f, Mathf.Max(1f, stopSlipMarginDbg) - Mathf.Abs(beta - betaPedalCmd));
+					float cAm = Mathf.Max(0.2f, Mathf.Abs(num));
+					float aP = PaceYawUse * Mathf.Max(1f, gPos / Mathf.Max(0.02f, PaceHorizon));
+					float aN = PaceYawUse * Mathf.Max(1f, gNeg / Mathf.Max(0.02f, PaceHorizon));
+					float lP = PaceMarginK * Mathf.Sqrt(2f * aP * mLeft / cAm);
+					float lN = PaceMarginK * Mathf.Sqrt(2f * aN * mLeft / cAm);
+					paceMarginLeadDbg = Mathf.Max(lP, lN);
+					reachPos += lP;
+					reachNeg += lN;
+				}
+				// 2.7.0 (PaceMeasured): the reach from what the axes are doing and what the allocator has already committed
+				float pMm = omega.x * 57.29578f;
+				float pDotRawM = paceInit ? ((omega.x - paceOmegaXPrev) / Mathf.Max(dt, 1E-04f) * 57.29578f) : 0f;
+				float pDotM = pacePDotF.Step(pDotRawM, PaceAccelTau, dt);
+				float dzH = 0f;
+				float dzAll = 0f;
+				float dxH = 0f;
+				float dxAll = 0f;
+				float gateZ = 0f;
+				float gateX = 0f;
+				float rHm = rM;
+				float pHm = pMm;
+				float ix = IaInv[0, 0] * 57.29578f;
+				float hdZP = 0f;
+				float hdZN = 0f;
+				float hdXP = 0f;
+				float hdXN = 0f;
+				paceNEffDbg = 0f;
+				paceDdDbg = 0f;
+				foreach (Effector seM in effs)
+				{
+					if (seM == null || !seM.active || seM.M == null || seM.N < 2)
+					{
+						continue;
+					}
+					// the increment in flight: from where the effector is to where the allocator sent it, and how much of
+					// that its servo covers within the horizon
+					float dd = seM.cmd - seM.now;
+					paceNEffDbg += 1f;
+					paceDdDbg += Mathf.Abs(dd);
+					float rateM = Mathf.Max(1f, seM.rate);
+					float ts = Mathf.Min(PaceHorizon, Mathf.Abs(dd) / rateM);
+					float dh = seM.now + Mathf.Sign(dd) * rateM * ts;
+					Vector3 mNow = seM.MAt(seM.now);
+					Vector3 mH = seM.MAt(dh);
+					Vector3 mT = seM.MAt(seM.cmd);
+					dzH += (mH.z - mNow.z) * iz;
+					dzAll += (mT.z - mNow.z) * iz;
+					dxH += (mH.x - mNow.x) * ix;
+					dxAll += (mT.x - mNow.x) * ix;
+					// 2.7.1: yaw and roll still available toward each side from the commanded deflections (the open capacity)
+					Vector3 mMax = seM.MAt(seM.max);
+					Vector3 mMin = seM.MAt(seM.min);
+					hdZP += Mathf.Max(0f, Mathf.Max(mMax.z, mMin.z) - mT.z) * iz;
+					hdZN += Mathf.Max(0f, mT.z - Mathf.Min(mMax.z, mMin.z)) * iz;
+					hdXP += Mathf.Max(0f, Mathf.Max(mMax.x, mMin.x) - mT.x) * ix;
+					hdXN += Mathf.Max(0f, mT.x - Mathf.Min(mMax.x, mMin.x)) * ix;
+				}
+				// the axis's demonstrated acceleration (a decaying peak), credited where nothing is committed yet
+				aYawSeen = Mathf.Max(Mathf.Abs(rDot), Mathf.Max(PaceFloor / PaceHorizon, aYawSeen - aYawSeen * dt / PaceSeenTau));
+				aRollSeen = Mathf.Max(Mathf.Abs(pDotM), Mathf.Max(PaceFloor / PaceHorizon, aRollSeen - aRollSeen * dt / PaceSeenTau));
+				rHm = rM + (rDot + 0.5f * dzH) * PaceHorizon;
+				pHm = pMm + (pDotM + 0.5f * dxH) * PaceHorizon;
+				// gravity's share of the sideslip: the jet falling sideways under the sideslip loop's own correction (its time
+				// constant 1 / KBeta). Tom: the one acceptable failure - excluded from the margin, never paid for with roll.
+				float gBm = ((tas > 40f) ? (9.81f * Mathf.Sin(phi * (MathF.PI / 180f)) * Mathf.Cos(theta * (MathF.PI / 180f)) / tas * 57.29578f * Mathf.Clamp01((tas - 40f) / 20f)) : 0f);
+				paceBetaG += (gBm - Mathf.Max(0.2f, Plugin.KBeta) * paceBetaG) * dt;
+				paceBetaG = Mathf.Clamp(paceBetaG, -20f, 20f);
+				// gravity is charged only for sideslip that exists and has its sign (the loop may be correcting it already)
+				float bErrM = beta - betaPedalCmd;
+				float bGEff = (bErrM * paceBetaG > 0f) ? Mathf.Sign(bErrM) * Mathf.Min(Mathf.Abs(bErrM), Mathf.Abs(paceBetaG)) : 0f;
+				float betaOwn = bErrM - bGEff;
+				float mLeftM = Mathf.Max(0f, Mathf.Max(1f, stopSlipMarginDbg) - Mathf.Abs(betaOwn));
+				paceMLeftDbg = mLeftM;
+				float cAmM = Mathf.Max(0.2f, Mathf.Abs(num));
+				// the yaw's capacity toward each side: no more than the allocator is delivering of the loop's demand (demand less
+				// its unmet report), no more than the axis is measurably doing plus the committed increment arriving within the
+				// horizon; at least a share of what it has shown it can do (so a move can start)
+				float desZ = omegaDotDes.z * 57.29578f;
+				float capZP = Mathf.Min(Mathf.Max(0f, desZ - Mathf.Max(0f, allocUnmet.z)), Mathf.Max(0f, rDot + dzH));
+				float capZN = Mathf.Min(Mathf.Max(0f, 0f - desZ - Mathf.Max(0f, 0f - allocUnmet.z)), Mathf.Max(0f, 0f - (rDot + dzH)));
+				capZP = Mathf.Max(capZP, PaceSeenUse * aYawSeen);
+				capZN = Mathf.Max(capZN, PaceSeenUse * aYawSeen);
+				// 2.7.1: while the allocator reports nothing unmet toward a side, the capacity there is the authority still available
+				// (so the loop is let ask for it); it falls to what is being delivered as the allocator reports it cannot. 2.7.0 used
+				// only the delivered / demonstrated figure, and the loop's demand is proportional to the lead the window allows, so
+				// the yaw was never asked for more than it had shown: a reversal at 413 kt sat at zero roll for 0.3 s with the rudders
+				// at 14 of 35 deg and unmet 0, and one at 369 kt rolled back toward the old side (Tom, 09:59 log).
+				// 2.7.2: saturation relative to the axis's authority (an unmet of 15 deg/s^2 is nothing at 400 kt and most of the yaw at
+				// 200 km/h, where aYaw is 23)
+				float satScZ = Mathf.Max(PaceSatDead, PaceSatFrac * aYaw);
+				float satZP = Mathf.Clamp01(Mathf.Max(0f, allocUnmet.z) / satScZ);
+				float satZN = Mathf.Clamp01(Mathf.Max(0f, 0f - allocUnmet.z) / satScZ);
+				// the open capacity: what the axis is doing plus the committed increment arriving within the horizon, plus the
+				// authority still available beyond the commanded deflections (zero with the effectors sent to their stops: then the
+				// move is paced by what arrives, the slew case of the 154 s / 339 kt reversal)
+				float openZP = Mathf.Max(0f, rDot + dzH) + PaceYawUse * hdZP;
+				float openZN = Mathf.Max(0f, 0f - (rDot + dzH)) + PaceYawUse * hdZN;
+				capZP = Mathf.Lerp(Mathf.Max(capZP, openZP), capZP, satZP);
+				capZN = Mathf.Lerp(Mathf.Max(capZN, openZN), capZN, satZN);
+				// 2.7.4: never above the allocator's own authority less its saturation derate (the 2.5.12 ceiling: past the rudder
+				// fade the tables overstate the stabs' yaw 3-4x, and the committed increment is read from those tables). 11:30 log,
+				// 116 s: a push-over from 64 deg AoA read 143-162 of capacity with 26-129 unmet and made 22 deg of sideslip.
+				float capCeilZ = Mathf.Max(5f, aYaw) * (1f - Mathf.Lerp(PaceSatDerateLo, PaceSatDerateHi, 1f - rudderAuth) * Mathf.Clamp01(yawSat));
+				capZP = Mathf.Min(capZP, capCeilZ);
+				capZN = Mathf.Min(capZN, capCeilZ);
+				// the lead that capacity closes inside the margin left (L^2 cos AoA / 2a = margin), plus the loop's ordinary
+				// tracking error, which shrinks with the margin so that at the margin the roll waits for the yaw
+				float flM = PaceFloor * Mathf.Clamp01(mLeftM / 2f);
+				float lPm = PaceMarginK * Mathf.Sqrt(2f * capZP * mLeftM / cAmM);
+				float lNm = PaceMarginK * Mathf.Sqrt(2f * capZN * mLeftM / cAmM);
+				// never less than what the capacity closes within the horizon: the loop keeps driving the axis at its capacity
+				// with the margin spent, instead of pinning the target to the axis (which asks it for nothing and stalls the move)
+				// 2.7.1: the floor is what the yaw loop needs as error to ask for that capacity (its gain KYaw; a held target has no
+				// feed-forward), so at the margin the lead x gain = the delivered capacity - the loop keeps asking exactly what the
+				// axis gives. 2.7.0's capacity x 0.15 s asked for a fraction of it.
+				// 2.7.1: the lead is the margin's (plus PaceLeadT of the capacity, the sideslip rate accepted while the roll waits); the
+				// yaw is driven by the loop's feed-forward instead - the target moves toward the demand at the capacity (below), so the
+				// loop asks exactly what the axis gives with no lead at all
+				// 2.17.0: the lead floor is the error the yaw loop needs to ask for the whole capacity, capacity / KYaw (the 2.7.1 comment
+				// above; the code had 0.1 s of capacity against a 2.5 /s loop, a quarter of it, and 2.7.2 switched off the feed-forward that
+				// covered the rest). With the margin spent and the yaw weak (no fins, 65 deg) the target was pinned 1 deg/s ahead of the
+				// rotation and the yaw was asked for ~5 deg/s^2 of its 20 (23:30 log, 110 s reversal: 2.5 s at +19 against a -30 demand).
+				float leadTw = (PaceLeadT < 0f) ? (1f / Mathf.Max(0.5f, Plugin.KYaw)) : PaceLeadT;
+				reachPos = Mathf.Max(lPm, capZP * leadTw) + flM;
+				reachNeg = Mathf.Max(lNm, capZN * leadTw) + flM;
+				paceMarginLeadDbg = Mathf.Max(lPm, lNm);
+				paceCapZPDbg = capZP;
+				paceCapZNDbg = capZN;
+				// the roll axis the same way (its shortfall is sideslip at sin AoA)
+				float desX = omegaDotDes.x * 57.29578f;
+				float capXP = Mathf.Min(Mathf.Max(0f, desX - Mathf.Max(0f, allocUnmet.x)), Mathf.Max(0f, pDotM + dxH));
+				float capXN = Mathf.Min(Mathf.Max(0f, 0f - desX - Mathf.Max(0f, 0f - allocUnmet.x)), Mathf.Max(0f, 0f - (pDotM + dxH)));
+				float satScX = Mathf.Max(PaceSatDead, PaceSatFrac * aRoll);
+				float satXP = Mathf.Clamp01(Mathf.Max(0f, allocUnmet.x) / satScX);
+				float satXN = Mathf.Clamp01(Mathf.Max(0f, 0f - allocUnmet.x) / satScX);
+				float openXP = Mathf.Max(0f, pDotM + dxH) + PaceRollUse * hdXP;
+				float openXN = Mathf.Max(0f, 0f - (pDotM + dxH)) + PaceRollUse * hdXN;
+				paceCapXPDbg = Mathf.Lerp(Mathf.Max(capXP, PaceSeenUse * aRollSeen, openXP), Mathf.Max(capXP, PaceSeenUse * aRollSeen), satXP);
+				paceCapXNDbg = Mathf.Lerp(Mathf.Max(capXN, PaceSeenUse * aRollSeen, openXN), Mathf.Max(capXN, PaceSeenUse * aRollSeen), satXN);
+				paceCapXPDbg = Mathf.Min(paceCapXPDbg, Mathf.Max(5f, aRollPos));
+				paceCapXNDbg = Mathf.Min(paceCapXNDbg, Mathf.Max(5f, aRollNeg));
+				// 2.7.2 (Tom, 10:19): the window does not hold the target in measured mode - the commanded steady rate is the only
+				// lever (the cap below), and a reversal from it runs at the tuned acceleration / braking whatever the yaw does.
+				// The window binds only while the allocator reports the axis cannot deliver what the loop asks (airframe-wide, any
+				// effector): a latch on the unmet report, on past PaceSatDead + PaceSatSpan x PaceGateOn, off below x PaceGateOff -
+				// never a blend toward the raw target (2.7.0's partial gate leaked it).
+				float satZm = Mathf.Max(satZP, satZN);
+				if (satZm > PaceGateOn)
+				{
+					paceLatchZ = true;
+				}
+				else if (satZm < PaceGateOff)
+				{
+					paceLatchZ = false;
+				}
+				gateZ = paceLatchZ ? 1f : 0f;
+				float satXm = Mathf.Max(satXP, satXN);
+				if (satXm > PaceGateOn)
+				{
+					paceLatchX = true;
+				}
+				else if (satXm < PaceGateOff)
+				{
+					paceLatchX = false;
+				}
+				gateX = paceLatchX ? 1f : 0f;
+				paceHdZPDbg = hdZP;
+				paceHdZNDbg = hdZN;
+				paceDzHDbg = dzH;
+				paceDzAllDbg = dzAll;
+				paceDxHDbg = dxH;
+				paceDxAllDbg = dxAll;
+				paceRHDbg = rHm;
+				pacePHDbg = pHm;
+				paceSeenZDbg = aYawSeen;
+				paceReachDbg = reachPos;
+				// the sideslip correction's share of the body yaw (last tick's rS, velocity-vector yaw)
+				float yawCorr = rSDbg * num;
+				// the demand is judged at the AoA the jet will have at the end of the horizon (an AoA sweep under the roll moves
+				// the yaw the roll needs at pS cos AoA x AoA rate; a push + roll through zero AoA reverses it)
+				float aH = (alpha + alphaDot * PaceHorizon) * (MathF.PI / 180f);
+				float sinH = Mathf.Sin(aH);
+				// 2.5.4: inside +-PaceSinMin of zero AoA the roll's share of the yaw demand (pS sin AoA) is too small for any roll to
+				// settle a yaw error - the yaw loop owns it - so the window is off there (2.5.3 divided by a floored sin and turned a
+				// leftover yaw rate at the zero crossing into roll demands of 400-570 deg/s, then a flip to zero: 09:44 log, 318 / 324
+				// / 328 s)
+				bool winOn = Mathf.Abs(sinH) >= PaceSinMin;
+				float sinD = winOn ? sinH : (PaceSinMin * ((sinH >= 0f) ? 1f : -1f));
+				float lo = (rM - reachNeg - yawCorr) / sinD;
+				float hi = (rM + reachPos - yawCorr) / sinD;
+				if (lo > hi)
+				{
+					float tmpP = lo;
+					lo = hi;
+					hi = tmpP;
+				}
+				// the roll axis the same way: the pair's body-roll demand (pS cos AoA - rS sin AoA) may not lead the measured roll
+				// rate by more than the roll axis can close within the horizon (its acceleration now, plus PaceRollUse of the
+				// roll authority on that side). Past ~40 deg AoA the roll axis is the weak one: the yaw delivers its share and the
+				// roll does not, and that too is sideslip (bench, full aft + roll at 400 km/h, 42 deg AoA: p 1 against 30 asked,
+				// r 22, sideslip -9).
+				float pM = pMm;
+				float pDot = pDotM;
+				float cosH = Mathf.Cos(aH);
+				float loR = float.MinValue;
+				float hiR = float.MaxValue;
+				if (Mathf.Abs(cosH) > PaceSinMin)
+				{
+					float rollPos = Mathf.Max(0f, pDot * PaceHorizon + PaceRollUse * aRollPos * PaceHorizon) + PaceFloor;
+					float rollNeg = Mathf.Max(0f, 0f - pDot * PaceHorizon + PaceRollUse * aRollNeg * PaceHorizon) + PaceFloor;
+					// 2.7.0: measured; a roll shortfall is sideslip at sin AoA, so the margin buys sqrt(2 a (margin - |beta|) / sin AoA) of roll-rate lead
+					float sAmR = Mathf.Max(0.05f, Mathf.Abs(num2));
+					float flR = PaceFloor * Mathf.Clamp01(paceMLeftDbg / 2f);
+					rollPos = Mathf.Max(PaceMarginK * Mathf.Sqrt(2f * paceCapXPDbg * paceMLeftDbg / sAmR), paceCapXPDbg * PaceLeadT) + flR;
+					rollNeg = Mathf.Max(PaceMarginK * Mathf.Sqrt(2f * paceCapXNDbg * paceMLeftDbg / sAmR), paceCapXNDbg * PaceLeadT) + flR;
+					float rollCorr = 0f - rSDbg * num2;
+					loR = (pM - rollNeg - rollCorr) / cosH;
+					hiR = (pM + rollPos - rollCorr) / cosH;
+					dbgWinLoR = loR; dbgWinHiR = hiR; dbgRollPos = rollPos;
+					if (loR > hiR)
+					{
+						float tmpR = loR;
+						loR = hiR;
+						hiR = tmpR;
+					}
+					// intersect; when the two axes disagree the yaw window stands (the sideslip is what is protected)
+					if (loR <= hi && hiR >= lo)
+					{
+						lo = Mathf.Max(lo, loR);
+						hi = Mathf.Min(hi, hiR);
+					}
+					else
+					{
+						// 2.7.0: the windows do not overlap - one axis is ahead of the other. The laggard is the one whose implied velocity
+						// roll is further from the stick's demand; its window stands, so the other axis is brought back to it (a yaw that
+						// cannot follow holds the roll down to it; a roll that cannot follow holds the yaw back to it)
+						float pSrM = (rM - yawCorr) / sinD;
+						float pSpM = (pM - rollCorr) / cosH;
+						if (Mathf.Abs(num11 - pSpM) > Mathf.Abs(num11 - pSrM))
+						{
+							lo = loR;
+							hi = hiR;
+						}
+					}
+				}
+				// never a roll against the one in progress (or against the one asked for, from rest): stop instead
+				float sideP = (Mathf.Abs(pTraj.x) > 2f) ? Mathf.Sign(pTraj.x) : Mathf.Sign(num11);
+				if (sideP > 0f && hi < 0f)
+				{
+					lo = 0f;
+					hi = 0f;
+				}
+				else if (sideP < 0f && lo > 0f)
+				{
+					lo = 0f;
+					hi = 0f;
+				}
+				// 2.7.0: the gate is the measured shortfall (allocator unmet + undelivered slew) per axis, nothing from the rudders' load
+				// (2.12.1: the 2.5.x rudder-usage gate and its airframe-usage variant, overwritten here since 2.7.0, are deleted)
+				float wSat = gateZ;
+				paceGateF = Mathf.Max(wSat, paceGateF - dt / Mathf.Max(0.02f, PaceGateTau));
+				wSat = winOn ? paceGateF : 0f;
+				paceGateXF = Mathf.Max(gateX, paceGateXF - dt / Mathf.Max(0.02f, PaceGateTau));
+				paceGateZDbg = wSat;
+				paceGateXDbg = paceGateXF;
+				float tgtRaw = num11;
+				paceTgtRaw = tgtRaw;
+				// 2.5.11: the two laws are blended by RollPaceRateBlend (0 = 2.5.7 pacing: window + acceleration cap; 1 = 2.5.8 rate
+				// cap; between = both, in proportion). RollPaceRateMode false = blend 0.
+				// 2.6.9: the rate cap below is a model of the RUDDERS - their crossing time to the far stop, their tables - so it holds
+				// only where the rudders are the yaw axis. Past the rudder fade (rudderAuth -> 0, 50-60 deg AoA here) it read the
+				// faded rudders' crossing against the stabs' authority and sat on PaceRateFloor (65 deg / 300 km/h: cap 10 against an
+				// airframe limit of 36), and at 0.4 that held the steady falling-leaf command to ~70 % of the limit while the
+				// window alone kept the reversal sideslip the same (5.7 vs 5.5 deg). So the blend counts where its model is valid:
+				// your RollPaceRateBlend at full where the rudders have their authority, fading to the window alone as they fade.
+				// 2.7.2: in measured mode the cap counts at every AoA (its capacity is the whole airframe's), at Tom's blend
+				// 2.7.2: in measured mode the cap's capacity is the whole airframe's; its share is Tom's blend, fading with the rudders
+				// (past their fade the yaw is the velocity roll and the one-axis law's own braking owns the reversal: no falling-leaf tax)
+				float rateBlend = Plugin.RollPaceRateBlend * Mathf.Clamp01(rudderAuth);
+				rateBlendEffDbg = rateBlend;
+				float num11Rate = num11;
+				float pSRateCap = 9999f;
+				if (rateBlend > 0f)
+				{
+					// 2.5.8 rate mode: no window, no acceleration cap. The target is capped at the roll rate whose full stick
+					// reversal at the tuned acceleration / braking the yaw can follow within the sideslip margin (your rule: slow
+					// the commanded rate, not the move). Yaw-rate swing of the reversal: dR = 2 pS |sin AoA|. The rudders cross
+					// from where they are to the other stop (tCross, slew), then pull dR down at their one-side yaw aOpp:
+					// sideslip ~ cos AoA x (dR tCross / 2 + dR^2 / (2 aOpp)) x PaceRateK. Solve for dR at the margin, cap pS.
+					float aOpp = 0f;
+					float tCross = 0f;
+					// Revoker 0.3.0: the rudder (faded with the fin) and the yaw nozzle, each crossing from where it is at its own
+					// slew; the crossing time the reversal waits for is the yaw-weighted mean of theirs (the two rudders of the F-22E
+					// were one time). No allocator-wide credit past the rudder fade: the nozzle is the yaw axis there (see yawEffs).
+					float tCrossW = 0f;
+					foreach (YawEff yP in yawEffs)
+					{
+						Effector seP = yP.e;
+						float aE = 0.5f * Mathf.Abs(seP.MAt(yP.hi).z - seP.MAt(yP.lo).z) * iz * yP.auth;
+						aOpp += aE;
+						// the crossing: from where the effector is now to the stop on the far side of center (the reversal side)
+						float far = (Mathf.Abs(seP.now - yP.hi) > Mathf.Abs(seP.now - yP.lo)) ? yP.hi : yP.lo;
+						tCrossW += aE * Mathf.Abs(far - seP.now) / Mathf.Max(1f, seP.rate);
+					}
+					tCross = (aOpp > 1E-06f) ? (tCrossW / aOpp) : 0f;
+					// Revoker 0.4.0: the fin's restoring yaw over the excursion (see stiffCredit)
+					aOpp += stiffCredit + dampCredit;
+					// 2.5.12: less what the allocator reports it cannot deliver
+					aOpp *= 1f - Mathf.Lerp(PaceSatDerateLo, PaceSatDerateHi, 1f - rudderAuth) * Mathf.Clamp01(yawSat);
+					float bMrg = Mathf.Max(1f, stopSlipMarginDbg);
+					// 2.7.2 (Tom, 10:19): the capacity a reversal can call on is the whole airframe's, not the rudders': every effector's
+					// yaw still available toward the reversal's side from where the allocator has it (rudders, stabs, the Ifrit's roll TVC
+					// - whatever the allocator can turn to yaw), less what it reports unmet, plus the airframe's own directional
+					// stiffness at the margin sideslip (the passive share: the airframe balancing laterally at this AoA). The dead time
+					// is the yaw-weighted travel of those effectors to the deflection the reversal needs.
+					float sideRev = 0f - Mathf.Sign(num11 * sinH);
+					float passive = PaceStiffUse * Mathf.Max(0f, slipStiffDbg) * bMrg;
+					// 2.8.1: the reversal's capacity is the estimator's figure toward the reversal side (measured yaw acceleration now, the
+					// committed increment arriving within the horizon, and what the allocator itself would still give - 1.2-1.4x the realised
+					// yaw in the 12:31 flight where the table headroom read 1.8x), plus the passive stiffness at the margin
+					aOpp = Mathf.Max(5f, ((sideRev >= 0f) ? capEst.capZeP : capEst.capZeN) + passive);
+					tCross = 0f;
+					float wT = 0f;
+					foreach (Effector seA in effs)
+					{
+						if (seA == null || !seA.active || seA.M == null || seA.N < 2)
+						{
+							continue;
+						}
+						Vector3 mA = seA.MAt(seA.max);
+						Vector3 mB = seA.MAt(seA.min);
+						float yA = Mathf.Abs(mA.z - mB.z) * iz;
+						if (yA < 5f)
+						{
+							continue;
+						}
+						float farA = ((mA.z >= mB.z) == (sideRev > 0f)) ? seA.max : seA.min;
+						tCross += yA * Mathf.Abs(farA - seA.cmd) / Mathf.Max(1f, seA.rate);
+						wT += yA;
+					}
+					tCross = (wT > 1f) ? (tCross / wT) : 0f;
+					rcAOppDbg = aOpp;
+					float cH = Mathf.Max(0.2f, Mathf.Abs(cosH));
+						// 2.5.10: RollPaceRateSlip (Dev key) scales the margin the cap aims at - the roll rate / sideslip compromise in flight
+						float cQ = 2f * bMrg * Plugin.RollPaceRateSlip / Mathf.Max(1f, aOpp * cH * Mathf.Max(0.1f, PaceRateK));
+					float dR = aOpp * (0f - 0.5f * tCross + Mathf.Sqrt(0.25f * tCross * tCross + cQ));
+					// 2.6.9 (PaceRateRamp): the reversal the cap models is the one the law will fly, not a step. The demanded yaw
+					// rate swings at aT |sin AoA|, aT = the trajectory's reversal acceleration as the law sets it (RevFloorK x roll
+					// authority, or the brake law) bounded by the governor's own open-loop cap for the reversing side - the num17
+					// the trajectory gets. The yaw answers after tCross / 2 at aOpp. Sideslip ~ the area between the two:
+					//   E(dR) = dR tau + dR^2 / 2 (1/aOpp - 1/aD),  tau = tCross / 2
+					// which is the 2.5.8 step model exactly as aD -> infinity. Where the yaw out-accelerates the demand it catches
+					// the ramp and tracks it: E saturates at aD tm tau / 2 and, inside the margin, the cap does not bind. Measured
+					// state and the law's own numbers only. (Bench, blend 0.4: full-aft reversal 320 km/h 6.6 -> 3.6 deg, worst of
+					// the regression set 6.6 -> 4.3; Ifrit 0.7.2 found the same 4x pessimism in the step model.)
+					if (PaceRateRamp)
+					{
+						float cA = Mathf.Max(Mathf.Abs(num), 0.05f);
+						float aLaw = (ReversalFloor && RevConst) ? (RevFloorK * aRoll / cA) : (Plugin.RollBrakeUse * (BrakeUseAll ? aRollGo : aRollWing) / cA);
+						// 2.7.2: in measured mode the trajectory runs at the law's own acceleration (no open-loop cap)
+						float aT = Mathf.Clamp(aLaw, 20f, Plugin.MaxRollAccel);
+						float aD = aT * Mathf.Max(Mathf.Abs(sinH), PaceSinMin);
+						float tau = 0.5f * tCross * RateCapTauK;
+						// 2.6.9 (RateCapNeedTravel): the rudders do not have to reach the far stop before the yaw turns - only the
+						// deflection that makes the yaw acceleration the reversal asks for (aD of their one-side aOpp), from where they
+						// sit, through center. At high dynamic pressure that is a few degrees (corkscrew entry at 700 km/h: rudders at
+						// +-8..13 deg, the far-stop crossing put the cap at 25-30 deg/s where reversals from 208 made 3.9 deg); at
+						// moderate q it is most of the stroke and nothing changes.
+						if (RateCapNeedTravel)
+						{
+							// the effectors need only the deflection that makes aD of their aOpp, through center: about (0.5 + 0.5 need) of the stroke
+							float needM = Mathf.Clamp01(aD / Mathf.Max(1f, aOpp));
+							tau = 0.5f * tCross * Mathf.Lerp(0.5f, 1f, needM) * RateCapTauK;
+						}
+						else if (RateCapNeedTravel)
+						{
+							float need = Mathf.Clamp01(aD / Mathf.Max(1f, aOpp));
+							float tN = 0f;
+							foreach (SurfaceEffector seN in surfaces)
+							{
+								if (seN.kind != SurfaceKind.Rudder || !seN.active || seN.M == null || seN.N < 2)
+								{
+									continue;
+								}
+								float cN = 0.5f * (seN.max + seN.min);
+								float hN = 0.5f * (seN.max - seN.min);
+								float farN = (Mathf.Abs(seN.now - seN.max) > Mathf.Abs(seN.now - seN.min)) ? seN.max : seN.min;
+								float dN = Mathf.Min(Mathf.Abs(farN - seN.now), Mathf.Abs(seN.now - cN) + need * hN);
+								tN = Mathf.Max(tN, dN / Mathf.Max(1f, seN.rate));
+							}
+							tau = 0.5f * tN * RateCapTauK;
+						}
+						float qM = bMrg * Plugin.RollPaceRateSlip / Mathf.Max(0.01f, cH * Mathf.Max(0.1f, PaceRateK));
+						float kQ = 0.5f * (1f / Mathf.Max(1f, aOpp) - 1f / Mathf.Max(1f, aD));
+						float disc = tau * tau + 4f * kQ * qM;
+						dR = (disc > 0f && tau + Mathf.Sqrt(disc) > 1E-04f) ? (2f * qM / (tau + Mathf.Sqrt(disc))) : 1E+06f;
+					}
+					pSRateCap = Mathf.Max(PaceRateFloor, dR / (2f * Mathf.Max(Mathf.Abs(sinH), PaceSinMin)));
+					rcAOppDbg = aOpp;
+					rcTcDbg = tCross;
+					rcSinHDbg = sinH;
+					if (RevSim)
+					{
+						// Revoker 0.6.0: the forward model, its reversal paced at the yaw the estimator says the effectors can add (as the Ifrit's)
+						float aPaceRev = Mathf.Max(20f, PaceYawUse * aOpp / Mathf.Max(Mathf.Abs(sinH), PaceSinMin));
+						pSRateCap = RevSimCap(bMrg * Plugin.RollPaceRateSlip, cosH, sinH, aPaceRev);
+					}
+					num11Rate = Mathf.Clamp(num11, 0f - pSRateCap, pSRateCap);
+				}
+				// the window may hold the roll in progress while the yaw comes down (that is the paced brake / reversal) but never
+				// asks for more roll than the stick or the roll in progress, and never for a roll against the one in progress
+				float clamped;
+				// 2.19.0: where the rudders are the yaw axis (rudW -> 1) the band holds the roll at the yaw's rotation; where they are not
+				// (faded past ~55 deg, or gone) the yaw effectors ARE the roll effectors (the stabs' differential, the flaperons) and a
+				// roll loop holding the roll against them starves the yaw brake: 3 Nov 00:09 log, both fins gone, 82.4 s reversal at 65
+				// deg - target held at 0 for 3.8 s, one stab at -21 and the other at 0, 8 deg/s^2 of yaw against a measured 24 when the
+				// roll went with the yaw (23:49 log, 62 s). There the target is paced toward the demand at the yaw's capacity instead.
+				float rudWwin = Mathf.Clamp01(rudderAuth) * Mathf.Clamp01(yawHealth / 0.5f);
+				float clampedBand = Mathf.Clamp(num11, lo, hi);
+				if (PaceHoldPacedByRudder && rudWwin < 0.999f)
+				{
+					// 2.17.0: while the yaw is reported saturated (the latch), the target is PACED toward the demand at the yaw's measured
+					// capacity (the 2.7.1 limiter, on the estimator's fin-aware figure), not clamped to the band. The band's lead scales
+					// with the sideslip margin LEFT, so with the margin spent it pinned the target to the rotation the jet had; the yaw loop
+					// then had no error to brake with and nothing moved until the unmet report happened to fall under the latch's release
+					// (23:30 log, both fins gone, 65 deg: reversal at 110 s held at +19 deg/s for 2.5 s against a -30 demand, zero crossing
+					// 4.0 s after the stick; held push-over at 157 s cut the roll target -47 -> -10..-23 while coordination needed -30..-54,
+					// sideslip +9 deg/s, departure). A move toward the axes (less lead) is free; a move away is paced at capacity / sin AoA.
+					float pSrNow = (rM - yawCorr) / sinD;
+					float from = paceRateInit ? paceRatePrev : pTraj.x;
+					float dirT = Mathf.Sign(num11 - from);
+					float capZd = Mathf.Max(PaceHoldCapFloor, (dirT * sinD > 0f) ? capEst.capZeP : capEst.capZeN);
+					float rateT = capZd / Mathf.Max(Mathf.Abs(sinD), PaceSinMin);
+					bool away = (num11 - pSrNow) * dirT > 0f;
+					float lim = from + dirT * rateT * dt;
+					float clampedPaced = (away && (num11 - lim) * dirT > 0f) ? lim : num11;
+					clamped = Mathf.Lerp(clampedPaced, clampedBand, rudWwin);
+				}
+				else
+				{
+					clamped = clampedBand;
+				}
+				// 2.18.0: the window may HOLD the target where it is; it may never move it back toward the rotation (away from the stick's
+				// demand). 23:49 log (both fins gone, 65 deg), 59.8 s reversal: the first 0.3 s of braking took the body roll 6 -> 1 deg/s
+				// while the yaw (30 deg/s, slow to shed) still implied a 33 deg/s rotation; the band set the target at rotation - lead = 25
+				// (p = 10.6 coordinated), the roll loop drove +X the OLD way for 1.2 s and took the stabs and flaperons from the yaw brake
+				// (tgtX +47..+58 against a -30 demand); once the target came down the yaw braked at 24 deg/s^2. Tom rejected the same
+				// behaviour in 2.7.0 ('keeps rolling the old way for a moment then reverses'). The target only ever moves toward the demand.
+				if (PaceNoRetreat && paceRateInit && Mathf.Abs(num11 - paceRatePrev) > 0.01f)
+				{
+					float dirD = Mathf.Sign(num11 - paceRatePrev);
+					if ((clamped - paceRatePrev) * dirD < 0f)
+					{
+						clamped = paceRatePrev;
+					}
+				}
+				// 2.20.0 (PaceStopNoFin): without the rudders the yaw sheds at the stabs' pace (20-25 deg/s^2 at 65 deg) whatever the
+				// roll does; a velocity-roll target of 0 against a yaw still carrying the rotation asks the body roll for -r tan AoA
+				// (anti-coordinated), and the roll loop's try at it is the reversal's sideslip (bench leaf rev 370 no fins: p +11 -> -10
+				// while r went 24 -> 7, sideslip 23 deg). Here the target may not go below the rotation the jet has with the body roll
+				// stopped (r sin AoA, falling with the yaw): p -> 0, the nose yaws through, the sideslip grows at r cos AoA only.
+				// The yaw loop is asked for its brake capacity directly (below, on rCmd), since this target alone gives it ~0.18 r.
+				// Scaled by the FIN loss, not the rudder fade: with the fins on above the fade the sideslip the old stop builds is what
+				// weathercocks the yaw round (bench 65 deg fullaft reversal 500: 1.6 s to zero; held to r sin AoA it took 3.1 s) - the
+				// fins are the yaw brake there, and the clean jet keeps its reversal.
+				paceStopNF = 0f;
+				float finKw = Mathf.Clamp01(yawHealth / 0.5f);
+				float stopNF = (PaceStopNoFin && finKw < 0.999f && sideP != 0f) ? Mathf.Max(0f, sideP * rM * sinD) : 0f;
+				if (sideP != 0f && clamped * sideP < stopNF)
+				{
+					clamped = Mathf.Lerp(sideP * stopNF, 0f, finKw);
+					paceStopNF = (stopNF > 0f) ? sideP : 0f;
+				}
+				else
+				{
+					float limP = Mathf.Max(Mathf.Abs(num11), Mathf.Abs(pTraj.x));
+					clamped = Mathf.Clamp(clamped, 0f - limP, limP);
+				}
+				paceLoDbg = lo;
+				paceHiDbg = hi;
+				paceClampDbg = clamped;
+				float num11Win = Mathf.Lerp(num11, clamped, wSat);
+				dbgWinLo = lo; dbgWinHi = hi; dbgReachPos = reachPos; dbgReachNeg = reachNeg; dbgYawCorr = yawCorr; dbgWSat = wSat; dbgRateCap = pSRateCap; dbgWin = clamped; dbgRDot = rDot; dbgPDot = pDot;
+				// the paced target continues from the target actually flown (the raw one while the latch is off)
+				paceRatePrev = num11Win;
+				paceRateInit = true;
+				// 2.6.1: climbing back out of a hold at the yaw's pace (see paceWinHeld)
+				paceRelDbg = 0f;
+				if (PaceReleasePace > 0f)
+				{
+					float dirRel = Mathf.Sign(num11Win * sinH);
+					float relAcc = PaceReleasePace * Mathf.Max(PaceFloor / PaceHorizon, PaceYawUse * Mathf.Max(dirRel * (rDot + dzH), PaceSeenUse * aYawSeen)) / Mathf.Max(Mathf.Abs(sinD), PaceSinMin);
+					if (num11Win * paceWinPrev < 0f)
+					{
+						paceWinSame = false;
+					}
+					if (!paceWinHeld)
+					{
+						paceWinSame = Mathf.Abs(pTraj.x) > 2f && pTraj.x * num11Win > 0f;
+					}
+					if (paceWinHeld && paceWinSame && num11Win * paceWinPrev >= 0f && Mathf.Abs(num11Win) > Mathf.Abs(paceWinPrev))
+					{
+						// the measured yaw already supports a roll of (r - correction) / sin AoA: up to that the climb is free (no yaw
+						// demand leads the yaw there); the pacing applies to the part above it
+						float pSup = (rM - yawCorr) / sinD;
+						float lim = Mathf.Max(Mathf.Abs(paceWinPrev) + relAcc * dt, (pSup * num11Win > 0f) ? Mathf.Abs(pSup) : 0f);
+						if (Mathf.Abs(num11Win) > lim)
+						{
+							paceRelDbg = Mathf.Abs(num11Win) - lim;
+							num11Win = Mathf.Sign(num11Win) * lim;
+						}
+					}
+					paceWinHeld = Mathf.Abs(num11Win) < Mathf.Abs(tgtRaw) - 1f;
+					paceWinPrev = num11Win;
+				}
+				else
+				{
+					paceWinHeld = false;
+					paceWinSame = false;
+					paceWinPrev = num11Win;
+				}
+				// blend: the window's hold and the rate cap's trim of the target, in proportion
+				// 2.6.12 (RateCapOnReversal): the cap's share of the target applies only while a reversal is under way - the stick
+				// asking for the opposite direction to the roll in progress. It predicts what a reversal from the present rate would
+				// cost, and with no reversal it was trimming the steady roll for one that never came (02 Nov 00:54 log, 340 kt
+				// corkscrew entry: roll 70 -> 17 deg/s at 45-55 deg AoA, sideslip 0.8-2.2 of a 4 deg margin; bench, the window
+				// holds 0 there and the whole hold is the cap's 41 %)
+				float revW = 1f;
+				num11 = Mathf.Lerp(num11Win, num11Rate, rateBlend * PaceBlendTargetK * revW);
+				paceLeadDbg = (rateBlend >= 0.5f) ? pSRateCap : ((sideP >= 0f) ? reachPos : reachNeg);
+				paceHoldDbg = tgtRaw - num11;
+				// 2.10.0: the 2.5.x open-loop acceleration cap (rudder tables) went with the table governor; the trajectory runs at the law's own acceleration
+				paceAccelCap = -1f;
+			}
+			else
+			{
+				paceRDotF.init = false;
+				pacePDotF.init = false;
+				paceRateInit = false;
+				paceGateF = 0f;
+				paceWinHeld = false;
+				paceWinSame = false;
+				paceWinPrev = 0f;
+				paceRelDbg = 0f;
+			}
+			paceOmegaZPrev = omega.z;
+			paceOmegaXPrev = omega.x;
+			paceInit = true;
 			guardDbg = x;
+			// 2.34.0 (PushGov): the lateral limit of the push side. Where the law would hold or bring the rotation down (stop, release,
+			// reversal, a stick target under the rotation) and the yaw cannot shed the sweep's demand, the trajectory comes down no faster
+			// than -L; where L > 0 it grows at L (the roll follows the yaw down)
+			// rate band [L, U] for the velocity-roll reference; outside it the trajectory is re-aimed (target) and its acceleration set to the
+			// band's edge. L > U (the pitch ran ahead of both axes this tick - the cap catches it next tick): the roll's edge, U.
+			bool pushGovOn = !float.IsNaN(pushGovL) && pushGovSide != 0f && !pushBleed && !pushHeld;
+			if (pushBleed) num11 = 0f;
+			float pushGovRate = 0f;
+			if (pushGovOn)
+			{
+				bool lawBrakes = pushGovSide * (num11 - pTraj.x) < 0f;
+				float num11Law = num11;
+				float lo = pushGovL, hi = Mathf.Max(pushGovL, pushGovU);
+				if (pushGovL > pushGovU) lo = hi = pushGovU;
+				// the law's own rate sign: braking (fast), or holding / growing (toward its target)
+				if (lawBrakes && lo > -1E+05f)
+				{
+					// braking: as fast as the law wants, but no faster than -lo; if lo > 0 the reference grows at lo instead
+					pushGovRate = lo;   // applied as min(num17, |lo|) below when lo < 0
+					if (lo > 0f) num11 = pushGovSide * Mathf.Max(Mathf.Max(Mathf.Abs(pTraj.x), Mathf.Min(Mathf.Abs(pTraj.x) + 30f, pushGovCeil)), pushGovSide * num11);
+					else if (hi < 0f) { }   // the law's brake is at least as fast as needed? (num17 >= |hi| normally)
+				}
+				else if (hi < 0f)
+				{
+					// holding or growing where the roll's ceiling says it must come down: brake at |hi|
+					pushGovRate = hi;
+					num11 = pushGovSide * Mathf.Max(0f, Mathf.Abs(pTraj.x) - 30f);
+				}
+				else if (lo > 0f)
+				{
+					// holding where the yaw says it must grow: grow at lo (no faster than hi)
+					pushGovRate = Mathf.Min(lo, hi);
+					num11 = pushGovSide * Mathf.Max(Mathf.Max(Mathf.Abs(pTraj.x), Mathf.Min(Mathf.Abs(pTraj.x) + 30f, pushGovCeil)), pushGovSide * num11);
+				}
+				else
+				{
+					pushGovOn = false;   // the law's own move is inside the band
+				}
+				// faded in over 2..8 deg/s of commanded AoA rate toward zero (an AoA held at a limit flickers around zero: no band there)
+				float wGt = Mathf.Clamp01((pushGovA - 2f) / 6f);
+				num11 = Mathf.Lerp(num11Law, num11, wGt);
+			}
 			pSTgtDbg = num11;
 			float num15 = Mathf.Abs(pTraj.x * num);
 			float max = Mathf.Lerp(Plugin.RollAccelUseLowIas, Plugin.RollAccelUse, Mathf.InverseLerp(60f, 110f, ias));
 			float a = Mathf.Clamp(0.85f - num15 / Mathf.Max(30f, pFull * (aRollGo / aRoll)), 0.1f, max) * aRollGo / Mathf.Max(Mathf.Abs(num), 0.05f);
 			float num16 = 0.6f * aYaw / Mathf.Max(Mathf.Abs(num2), 0.05f);
-			// Ifrit 0.3.8: the yaw-coordination cap on the roll acceleration fades with latHoldK too (11 m/s, 10 deg AoA: ~8
-			// deg/s^2 from a 5 deg/s^2 yaw axis held the roll entry to a crawl where no coordination is possible anyway)
-			float num17 = (latAccDbg = Mathf.Min(a, Mathf.Lerp(a, RollEntryCoord * num16, latLimK)));
+			// 2.6.0: the trajectory's yaw-coordination caps (RollEntryCoord, BrakeYawCap, RevYawCap, CoordJerk) are gone; the pace
+			// governor's acceleration cap (paceAccelCap) is the only pacing of the trajectory
+			float num17 = (latAccDbg = a);
 			// 1.8.41: the roll entry's acceleration yields with the governor too (the entry is where the surfaces deflect most)
 			num17 *= Mathf.Lerp(RollGovAccelFloor, 1f, rollGov);
 			if (pTraj.x * (num11 - pTraj.x) < 0f)
 			{
 				float num18 = aRoll / Mathf.Max(30f, pFull);
-				num17 = Mathf.Min((Plugin.RollBrakeUse * (BrakeUseAll ? aRollGo : aRollWing) + num18 * num15) / Mathf.Max(Mathf.Abs(num), 0.05f), BrakeYawCap * num16);
-				if (num11 * pTraj.x < 0f && Mathf.Abs(num11) > 10f && ReversalFloor)
+				num17 = (Plugin.RollBrakeUse * (BrakeUseAll ? aRollGo : aRollWing) + num18 * num15) / Mathf.Max(Mathf.Abs(num), 0.05f);
+				// 2.7.0 (PaceRevIntent): a reversal the stick asked for is a reversal, even while the measured window holds the target on
+				// the near side - it brakes at the reversal's tuned acceleration, not the stop's
+				bool revIntent = PaceRevIntent && paceTgtRaw * pTraj.x < 0f && Mathf.Abs(paceTgtRaw) > 10f;
+				if (((num11 * pTraj.x < 0f && Mathf.Abs(num11) > 10f) || revIntent) && ReversalFloor)
 				{
-					float num19 = Mathf.Min(RevFloorK * aRoll / Mathf.Max(Mathf.Abs(num), 0.05f), num16);
-					num17 = (revA = (RevConst ? Mathf.Min(num19, RevYawCap * num16) : Mathf.Max(num17, num19)));
-					revTarget = num11;
+					float num19 = RevFloorK * aRoll / Mathf.Max(Mathf.Abs(num), 0.05f);
+					num17 = (revA = (RevConst ? num19 : Mathf.Max(num17, num19)));
+					revTarget = revIntent ? paceTgtRaw : num11;
 				}
 			}
 			else if (revA > 0f && RevCarry)
@@ -8778,7 +11333,30 @@ namespace Revoker_FS12.FCS
 					num17 = Mathf.Lerp(num17, Mathf.Min(num17, revCap), dyG);
 				}
 			}
+			if (paceAccelCap > 0f)
+			{
+				num17 = Mathf.Min(num17, paceAccelCap);
+			}
 			num17 = Mathf.Clamp(num17, 20f, Plugin.MaxRollAccel);
+			if (pushGovOn)
+			{
+				// faded in over 2..8 deg/s of commanded AoA rate (as the target above)
+				float wG = Mathf.Clamp01((pushGovA - 2f) / 6f);
+				num17 = Mathf.Lerp(num17, Mathf.Min(num17, Mathf.Abs(pushGovRate)), wG);
+			}
+			pushHeldB = 0f;
+			if (pushBleed)
+			{
+				num17 = Mathf.Max(0.5f, pushPlanBleed);
+			}
+			else if (pushHeld && pTraj.x * (num11 - pTraj.x) < 0f)
+			{
+				// held stick, the roll moving toward a lower target (the law's own: the stick, the pace window): no faster than the plan's
+				// yaw budget leaves after the AoA's share, and no faster than the law's own brake
+				float aDotP = Mathf.Max(0f, (0f - Mathf.Sign(alpha)) * (qCmd - omegaV));
+				pushHeldB = Mathf.Max(0f, pushPlanD - Mathf.Abs(pTraj.x) * Mathf.Abs(num) * aDotP * (MathF.PI / 180f)) / Mathf.Max(0.05f, Mathf.Abs(num2));
+				num17 = Mathf.Max(0.5f, Mathf.Min(num17, pushHeldB));
+			}
 			float a2 = Mathf.Min(num17 / RollJerkTau, RollJerkServo * aRoll * rollSlew / Mathf.Max(Mathf.Abs(num), 0.05f));
 			if (isAI && Plugin.AIDirectRoll)
 			{
@@ -8792,24 +11370,6 @@ namespace Revoker_FS12.FCS
 			// (CoordJerkK of it), below the rudder fade only (rudderAuth), so roll entries and reversals at moderate AoA no
 			// longer outrun the yaw axis and leave sideslip behind.
 			float jFloor = 100f;
-			if (CoordJerkK > 0f && !isAI && rudderAuth > 0.01f)
-			{
-				float yawSlew = 0f;
-				foreach (SurfaceEffector seR in surfaces)
-				{
-					if (seR.kind == SurfaceKind.Rudder && seR.active && seR.rate > 0f)
-					{
-						yawSlew = Mathf.Max(yawSlew, seR.rate / Mathf.Max(1f, 0.5f * (seR.max - seR.min)));
-					}
-				}
-				if (yawSlew > 0f)
-				{
-					float jY = CoordJerkK * aYaw * yawSlew / Mathf.Max(Mathf.Abs(num2), 0.05f);
-					jY /= Mathf.Max(rudderAuth, 0.01f);
-					a2 = Mathf.Min(a2, jY);
-					jFloor = Mathf.Min(jFloor, Mathf.Max(CoordJerkFloor, jY));
-				}
-			}
 			coordJerkDbg = a2;
 			latAccDbg = num17;
 			latJerkDbg = Mathf.Max(a2, jFloor);
@@ -8932,7 +11492,26 @@ namespace Revoker_FS12.FCS
 			// ramped and the sideslip loop ran at KBeta at 70 deg AoA; the yaw nozzle carries the yaw part of the correction at any
 			// IAS below the TVC cutoff, so it opens the ramp too
 			bool yawTvcSlip = Plugin.SlipYawTvcAssist && tvcy != null && tvcy.active;
-			if (Mode != FcsMode.GearDownRate && Plugin.SlipTvcAssist && (aRollTvc > 0.5f || yawTvcSlip))
+			if (Mode != FcsMode.GearDownRate && Plugin.SlipGainFromLoops)
+			{
+				// Revoker 0.2.14 (SlipGainFromLoops): the sideslip-hold gain is what the rate loops carrying the correction can
+				// follow. rS is flown as body yaw rS cos(a) through the yaw-rate loop (KYaw: 2.5/s = 0.4 s) and as body roll
+				// -rS sin(a) through the roll-rate loop (KRoll: 6/s = 0.17 s), each plus the actuator lag. The sideslip loop
+				// closes through them as gain/s x lag (beta-dot = -rS), so its phase margin is set by gain x lag: SideslipGain
+				// (1.3) is the gain the yaw loop supports (1.3 x 0.47 s), and where the correction rides the faster roll loop
+				// the gain rises with the shorter lag, cos^2 / sin^2 weighted by the kinematic split. A path that would have
+				// to deliver its share beyond the spare authority of its axis (the roll axis braking or saturated for the
+				// velocity-vector roll itself) counts the time that share takes at the spare authority instead of 1/K, capped
+				// at 1 s. 30 Oct 22:48 log, full push + full roll, -8 -> -55 deg AoA, 78 -> 55 kt: the fixed SlipGainHighAoA
+				// ramp (4, opened on this jet by the yaw nozzle in 0.2.1) ran the loop through the 0.4 s yaw loop at ~15 deg of
+				// phase margin: sideslip -3.4 <-> +3.6 deg at ~1 Hz, yaw rate +-12 deg/s about its command, rudder stop to
+				// stop, the roll governor cutting the roll twice (the hitch). The F-22E, at 1.3 there, recovers -6.8 deg in one
+				// move. Here: 0 deg AoA 1.3, -50 deg ~1.85, 70 deg ~2.3.
+				float gLoops = Plugin.KBeta * latLagYawNom / Mathf.Max(0.02f, latLagEff);
+				// pedals centred only: with pedal in, the pedal sideslip command is tracked at KBeta as before
+				num22 = Mathf.Lerp(num22, gLoops, 1f - Mathf.Clamp01(Mathf.Abs(sy) / 0.2f));
+			}
+			else if (Mode != FcsMode.GearDownRate && Plugin.SlipTvcAssist && (aRollTvc > 0.5f || yawTvcSlip))
 			{
 				// pedals centred only: with pedal in, the pedal sideslip command is tracked at KBeta as before
 				num22 = Mathf.Lerp(num22, Mathf.Max(num22, Plugin.SlipGainHighAoA), Mathf.InverseLerp(Plugin.SlipGainAoAStart, Plugin.SlipGainAoAStart + 20f, Mathf.Abs(alpha)) * (1f - Mathf.Clamp01(Mathf.Abs(sy) / 0.2f)));
@@ -9007,13 +11586,45 @@ namespace Revoker_FS12.FCS
 			float num26 = Mathf.Max(1f, Mathf.Max(Mathf.Abs(num24) / pLimSc, Mathf.Abs(num25) / num8));
 			pCmd = num24 / num26;
 			rCmd = num25 / num26;
+			// 2.20.0 (PaceStopNoFin): in the no-fin stop the yaw loop is asked for its brake capacity (the error that makes it, capacity /
+			// KYaw, from the measured yaw), where the stopped-roll target alone gives it a fraction of that
+			paceStopNFDbg = paceStopNF;
+			if (paceStopNF != 0f)
+			{
+				float capB = Mathf.Max(PaceHoldCapFloor, (paceStopNF > 0f) ? capEst.capZeN : capEst.capZeP);
+				float rNF = omega.z * 57.29578f - paceStopNF * capB / Mathf.Max(0.5f, Plugin.KYaw);
+				float finKnf = Mathf.Clamp01(yawHealth / 0.5f);
+				if ((rNF - rCmd) * paceStopNF < 0f)
+				{
+					rCmd = Mathf.Lerp(rNF, rCmd, finKnf);
+				}
+			}
+			// 2.4.17 no-chase on a roll brake: while the trajectory brakes the roll (stop, reversal, or a limit coming down), the
+			// yaw loop is not asked for more yaw rate than the jet already has on the same side. In a fast roll at AoA the yaw
+			// trails its coordinated command (the rudders at their stop: 30 Oct 14:35 log, 267.7 s, r -27 against -36); left to
+			// chase it, the yaw kept accelerating for 0.3 s after the stick came back (bench: -33 -> -43 deg/s), and all of that
+			// had to be braked again by rudders slewing across their travel. Same AoA band as the roll-stop governor.
+			float rCmdCoord = rCmd;
+			noChaseDbg = 0f;
+			// 2.4.18: only while the coordinated yaw command itself is shrinking. Under a rolling pull the trajectory brakes the
+			// roll (the pull governor / trade) while the rising AoA raises the yaw the roll needs (pS sin AoA); holding the yaw there
+			// built sideslip (bench, full roll then full aft at 400 km/h: 2.9 -> 4.9 deg in 2.4.17)
+			// rate of the yaw the roll itself needs, |pS| sin|AoA|, from the trajectory's own acceleration and the AoA rate
+			// (or the AoA not rising fast: at a steady AoA the braking trajectory alone sets it, from its first tick)
+			// 2.5.15: retired with the pace governor at level 3 (bench at blend 0.41 / margin 4: stops 5.2 -> 4.1 worst, reversals
+			// 8.8 -> 9.3, regressions mostly down 0.2-4 deg, one up 1.6; a wash - one device fewer)
 			pDotFF = pTraj.v * num / num26;
 			SlipHistPush((num23 / num26 - num21) * predGate, dt);
 			float num27 = aRoll / Mathf.Max(30f, pFull);
 			pCmd += Plugin.RollLead * Mathf.Max(0f, num27 - 2.5f) * pDotFF;
 			float t2 = Mathf.Max(Mathf.InverseLerp(200f, 300f, ias), Mathf.InverseLerp(YawFFAoA0, YawFFAoA1, Mathf.Abs(alpha)));
-			rDotFF = Mathf.Lerp(Plugin.YawRateFF, 1f, t2) * rDotF.Step((rCmd - rCmdPrev) / dt, 0.1f, dt);
+			// 2.4.17: the yaw feed-forward follows the coordinated command, not the no-chase hold (its release would step it)
+			rDotFF = Mathf.Lerp(Plugin.YawRateFF, 1f, t2) * rDotF.Step((rCmdCoord - rCmdCoordPrev) / dt, 0.1f, dt);
+			rCmdCoordPrev = rCmdCoord;
 			pCmdPrev = pCmd;
+			// 2.4.18: the rate of the yaw-rate command the loop actually follows (after the no-chase hold), for the yaw slew lead
+			rCmdRateF += ((rCmdLeadInit ? ((rCmd - rCmdPrev) / Mathf.Max(dt, 1E-04f)) : 0f) - rCmdRateF) * (dt / (0.05f + dt));
+			rCmdLeadInit = true;
 			rCmdPrev = rCmd;
 			if (Mathf.Abs(omega.z * 57.29578f) > num8 && rDotFF * omega.z > 0f)
 			{
@@ -9023,7 +11634,7 @@ namespace Revoker_FS12.FCS
 
 		public void WriteHeader(TextWriter w)
 		{
-			w.Write("t,mode,ias,tas,rho,alpha,beta,nz,nAlpha,tw,p,q,r,sp,sr,sy,qB,qRaw,qCmd,qT,pCmd,rCmd,aUp,aDn,betaG,alphaCmd,nCmd,unload,prot,omegaV,phi,theta,tvcCmd,tvcNow,nMaxAero,alphaAtNMax,gAvail,gInt,aInt,flapBias,flapTarget,hlPos,relief,rudderAuth,yawSat,aRoll,aYaw,pMax,pStockRef,pFull,rMax,guard,pSmax,pSTarget,latAcc,rS,stabPitchFrac,gndBrake,revFlow,asymDy,asymAr,asymAy,asymU,asymCap,asymCapEff,asymCapNeg,dMeasR,dMeasY,asymCr,asymCy,asymFFr,asymFFy,asymMr,asymMy,asymFFGate,rollPitchFF,gUnder,pitchPrio,stabRateBound,momentLead,rollTrim,aRollPos,aRollNeg,latReserve,aUpPitch,aDnPitch,aBrakeTgt,stabBranch,tvcAnchor,tvcBudget,rudSide,gsRCmd,gsNws,gsRud,gsHold,gsLineY,asymCapPitch,pitchNeed,coupRollLim,rpGate,rpBand,rollGov,rollGovMargin,iasDot,qPredK,asymCapRaw,asymCapFilt,alphaCmdRaw,nCmdRaw,rateBlendAoA,hiRate,rateW,zoneX,authCap,authCapEff,nLiftMax,hybridDMacc,floatOn,floatS,rateBlendAoANeg,nLiftMin,hiSide,authCapNeg,vmcLim,engOut,fuelTrimCm,yawHealth,capIUp,capIDn,capPushU,slipRate,slipGov,yawAnchor,gRateLaw,rateCmdG,negGate,sharedLat,rollGovPred,loadRev,stickLead,capOn,capQ,sweepLim,slatRelief,hlPosNow,slipAlloc,coupGate,pitchLead,slipGovPull,decel,pullTrade,abShare,abTgt,abOpen,fightK,pullFFBoost,tvcdCmd,tvcdNow,splitL,splitR,aRollTvc,pSlipMax,slipGain,droopIn,droopOut,revSense,slipPred,slipHold,splitTier,tvcHold,qTrajV,fightGate,abGate,engAbRatio,engMatchLoss,splitUsage,settledWin,asymThrY,asymLoadY,massKg,nx,capStart,capFlat,capUMin,capULim,gsWheel,gsIndi,gsRdot,gsNu,gsFyK,tvcyCmd,tvcyNow,tvcyHold,canL,canR,flapHL,flapHR");
+			w.Write("t,mode,ias,tas,rho,alpha,beta,nz,nAlpha,tw,p,q,r,sp,sr,sy,qB,qRaw,qCmd,qT,pCmd,rCmd,aUp,aDn,betaG,alphaCmd,nCmd,unload,prot,omegaV,phi,theta,tvcCmd,tvcNow,nMaxAero,alphaAtNMax,gAvail,gInt,aInt,flapBias,flapTarget,hlPos,relief,rudderAuth,yawSat,aRoll,aYaw,pMax,pStockRef,pFull,rMax,guard,pSmax,pSTarget,latAcc,rS,stabPitchFrac,gndBrake,revFlow,asymDy,asymAr,asymAy,asymU,asymCap,asymCapEff,asymCapNeg,dMeasR,dMeasY,asymCr,asymCy,asymFFr,asymFFy,asymMr,asymMy,asymFFGate,rollPitchFF,gUnder,pitchPrio,stabRateBound,momentLead,rollTrim,aRollPos,aRollNeg,latReserve,aUpPitch,aDnPitch,aBrakeTgt,stabBranch,tvcAnchor,tvcBudget,rudSide,gsRCmd,gsNws,gsRud,gsHold,gsLineY,asymCapPitch,pitchNeed,coupRollLim,rpGate,rpBand,rollGov,rollGovMargin,iasDot,qPredK,asymCapRaw,asymCapFilt,alphaCmdRaw,nCmdRaw,rateBlendAoA,hiRate,rateW,zoneX,authCap,authCapEff,nLiftMax,hybridDMacc,floatOn,floatS,rateBlendAoANeg,nLiftMin,hiSide,authCapNeg,vmcLim,engOut,fuelTrimCm,yawHealth,capIUp,capIDn,capPushU,slipRate,slipGov,yawAnchor,gRateLaw,rateCmdG,negGate,sharedLat,rollGovPred,loadRev,stickLead,capOn,capQ,sweepLim,slatRelief,hlPosNow,slipAlloc,coupGate,pitchLead,slipGovPull,decel,pullTrade,abShare,abTgt,abOpen,fightK,pullFFBoost,tvcdCmd,tvcdNow,splitL,splitR,aRollTvc,pSlipMax,slipGain,droopIn,droopOut,revSense,slipPred,slipHold,splitTier,tvcHold,qTrajV,fightGate,abGate,engAbRatio,engMatchLoss,splitUsage,settledWin,asymThrY,asymLoadY,massKg,nx,capStart,capFlat,capUMin,capULim,gsWheel,gsIndi,gsRdot,gsNu,gsFyK,tvcyCmd,tvcyNow,tvcyHold,canL,canR,flapHL,flapHR,latLag,slipLead,stopSlipLim,stopSlipAB,stopSlipU,stopSlipPred,stopSlipMargin,stopSlipHold,yawSatPitch,yawLead,paceLead,paceHold,slipTol,slipDep,slipAuth,slipStiff,paceRel,tradeAlpha,slipDamp,dampCredit,yawCap,rollGate,rateCap,revSimBeta,revSimT,paceReach" + CapacityEstimator.Header() + ",alphaRoot,betaRoot,airRefCg,alphaCg,betaCg,nuR,nuY,anchR,anchY,unR,unY,gUnmetX,gUnmetZ,paceGateZ,paceGateX,paceMLeft,paceCapZP,paceCapZN,paceCapXP,paceCapXN,capSwp,capShd,aYawShed,ppOn,ppQ,ppReach,rateCapLag,axWr,axWp,axWy");
 			foreach (SurfaceEffector surface in surfaces)
 			{
 				w.Write("," + surface.name + "_cmd," + surface.name + "_now," + surface.name + "_aoaNow," + surface.name + "_aoaCmd");
@@ -9079,6 +11690,42 @@ namespace Revoker_FS12.FCS
 			// Revoker 0.1.0: yaw nozzle command / angle / neutral-hold weight, and the two canards' deflection
 			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2}", (tvcy != null) ? tvcy.cmdOut : 0f, (tvcy != null) ? tvcy.now : 0f, tvcYawNeutralW, (surfaces.Count > 0) ? surfaces[0].now : 0f, (surfaces.Count > 1) ? surfaces[1].now : 0f));
 			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2}", (hinges.Count > 0) ? hinges.Find((HingeFlapEffector h) => h.left)?.hingeNow ?? 0f : 0f, (hinges.Count > 0) ? hinges.Find((HingeFlapEffector h) => !h.left)?.hingeNow ?? 0f : 0f));
+			// Revoker 0.2.15: the lateral loops' answer lag (s) and the governor's look-ahead (s)
+			w.Write(string.Format(invariantCulture, ",{0:F3},{1:F3}", latLagEff, slipLeadDbg));
+			w.Write(string.Format(invariantCulture, ",{0:F0},{1:F0},{2:F2},{3:F2},{4:F1},{5:F2},{6:F1},{7:F3}", Mathf.Min(stopSlipLimDbg, 999f), stopSlipABDbg, stopSlipUDbg, stopSlipPredDbg, stopSlipMarginDbg, stopSlipHoldDbg, yawSatPitchDbg, yawLeadDbg));
+			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1},{2:F1},{3:F1},{4:F1},{5:F2},{6:F2},{7:F1}", paceLeadDbg, paceHoldDbg, slipTolDbg, slipDepDbg, slipAuthDbg, slipStiffDbg, paceRelDbg, tradeAlphaDbg));
+			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F0}", slipDampDbg, dampCredit));
+			w.Write(string.Format(invariantCulture, ",{0:F0},{1:F2}", yawCapDbg, rollLoadDbg));
+			w.Write(string.Format(invariantCulture, ",{0:F0},{1:F2},{2:F2},{3:F1}", Mathf.Min(dbgRateCap, 9999f), revSimBetaDbg, revSimTDbg, paceReachDbg));
+			capEst.Row(w, invariantCulture);
+			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2},{3:F2},{4:F2}", alphaRoot, betaRoot, AirDataAtCg ? 1 : 0, alphaCgDbg, betaCgDbg));
+			// Revoker 0.8.2: what the roll / yaw rate loops ask for (deg/s^2; ~0 with the stick centred once the jet holds its command),
+			// how far the tables' roll / yaw columns were off their live moment this tick before anchoring (deg/s^2, summed), and what
+			// the allocation left unmade of its target (deg/s^2, the main solve)
+			{
+				Vector3 anchSum = Vector3.zero;
+				foreach (SurfaceEffector sA in surfaces)
+				{
+					if (sA.active)
+					{
+						anchSum += sA.anchorDbg;
+					}
+				}
+				foreach (HingeFlapEffector hA in hinges)
+				{
+					if (hA.active)
+					{
+						anchSum += hA.anchorDbg;
+					}
+				}
+				w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3:F2},{4:F2},{5:F2}", omegaDotDes.x * 57.29578f, omegaDotDes.z * 57.29578f, anchSum.x * IaInv[0, 0] * 57.29578f, anchSum.z * IaInv[2, 2] * 57.29578f, -allocResMain.x, -allocResMain.z));
+			}
+			// 0.6.0: the governor port's columns (F-22E 3.0.0): the allocator's unmet (filtered), the pace window's gates, margin left and
+			// capacities, the push governor's caps, the push plan, the reach-pass re-solves, the rate cap's servo lag, the axis weights
+			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1},{2:F2},{3:F2},{4:F1},{5:F0},{6:F0},{7:F0},{8:F0}", allocUnmet.x, allocUnmet.z, paceGateZDbg, paceGateXDbg, paceMLeftDbg, paceCapZPDbg, paceCapZNDbg, paceCapXPDbg, paceCapXNDbg));
+			w.Write(string.Format(invariantCulture, ",{0:F1},{1:F1},{2:F1},{3},{4:F1},{5}", capSweepDbg, Mathf.Clamp(capShedDbg, -999f, 999f), aYawShedDbg, pushPlanOn ? 1 : 0, pushPlanOn ? pushPlanQNow : 0f, alloc.reachMoves - reachLogPrev));
+			reachLogPrev = alloc.reachMoves;
+			w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F2},{3:F2}", rateCapLagDbg, axWDbg.x, axWDbg.y, axWDbg.z));
 			foreach (SurfaceEffector surface in surfaces)
 			{
 				w.Write(string.Format(invariantCulture, ",{0:F2},{1:F2},{2:F1},{3:F1}", surface.cmd, surface.now, surface.localAoANow, surface.localAoACmd));

@@ -228,6 +228,18 @@ namespace Revoker_FS12.FCS
 					}
 					try
 					{
+						int ns = StallStaggerJobs.Register(a);
+						if (ns > 0)
+						{
+							Plugin.Log.LogInfo($"Revoker FCS staggered elevon stall on {((UnityEngine.Object)(object)a).name}: {ns} parts get their own curves (inboard {Plugin.InnerFlaperonStallAoA:F0}, outboard {Plugin.OuterFlaperonStallAoA:F0} deg, knee-preserving).");
+						}
+					}
+					catch (Exception exS)
+					{
+						Plugin.Log.LogWarning("Revoker FCS staggered elevon stall: " + exS.Message);
+					}
+					try
+					{
 						int ncb = CamberForce.Attach(a);
 						Plugin.Log.LogInfo($"Revoker FCS camber coupling: {ncb} surfaces paired with their wing section (flap K {Plugin.FlapCamberK:F2}, aileron K {Plugin.AileronCamberK:F2}).");
 					}

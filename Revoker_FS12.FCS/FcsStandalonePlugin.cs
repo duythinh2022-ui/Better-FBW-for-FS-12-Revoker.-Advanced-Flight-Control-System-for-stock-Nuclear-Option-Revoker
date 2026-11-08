@@ -10,7 +10,7 @@ namespace Revoker_FS12.FCS
 	[BepInDependency(DevGuid, BepInDependency.DependencyFlags.SoftDependency)]
 	public class FcsStandalonePlugin : BaseUnityPlugin
 	{
-		public const string Version = "0.2.9";
+		public const string Version = "0.8.2";
 
 		// the dev/debug unlock: a separate, empty plugin DLL. When it is loaded (soft dependency, so before this one),
 		// every setting other than the player ones is bound to its config file and shows in the ConfigurationManager

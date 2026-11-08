@@ -16,6 +16,34 @@ namespace Revoker_FS12.FCS
 
 		private readonly List<AirfoilTable> tables = new List<AirfoilTable>();
 
+		// Revoker 0.2.20: the inboard elevons (hinge flaps). With ElevonStallStagger their camber share on wing2 is applied here
+		// as a force on the inboard curve instead of by turning wing2's lift normal (which the game evaluates on wing2's own,
+		// unstaggered curve: that share, 0.46 x 3.8 m2, is larger than the elevon's own 1.4 m2 and would have kept the pair's
+		// reversal near 40-45 deg).
+		private readonly List<HingeFlapEffector> hinges = new List<HingeFlapEffector>();
+
+		private readonly List<AirfoilTable> hingeTables = new List<AirfoilTable>();
+
+		public static void AddHinge(Aircraft a, HingeFlapEffector hf, AirfoilTable table)
+		{
+			if (a == null || hf == null || table == null)
+			{
+				return;
+			}
+			GameObject go = ((Component)(object)a).gameObject;
+			CamberForce c = go.GetComponent<CamberForce>();
+			if (c == null)
+			{
+				c = go.AddComponent<CamberForce>();
+				c.ac = a;
+			}
+			if (!c.hinges.Contains(hf))
+			{
+				c.hinges.Add(hf);
+				c.hingeTables.Add(table);
+			}
+		}
+
 		public static int Attach(Aircraft a)
 		{
 			if (a == null)
@@ -57,7 +85,9 @@ namespace Revoker_FS12.FCS
 				}
 				c.surfs.Add(cs);
 				c.hosts.Add(host);
-				c.tables.Add(StallStagger.TableFor(host, af));
+				// Revoker 0.2.20: the camber increment uses the elevon's own (staggered) curve, so it reverses with the elevon
+				StallStagger.Fam fS = StallStagger.Enabled ? StallStagger.FamilyOf(cs.gameObject.name) : StallStagger.Fam.None;
+				c.tables.Add((fS != StallStagger.Fam.None) ? StallStagger.TableForFamily(af, fS) : StallStagger.TableFor(host, af));
 			}
 			return (c != null) ? c.surfs.Count : 0;
 		}
@@ -85,6 +115,30 @@ namespace Revoker_FS12.FCS
 			}
 			catch
 			{
+			}
+			if (Plugin.StallStagger && Plugin.FlapCamberK > 0f)
+			{
+				for (int j = 0; j < hinges.Count; j++)
+				{
+					HingeFlapEffector hf = hinges[j];
+					if (hf == null || !hf.driving || !hf.Valid || hf.host == null || hf.host.rb == null || hf.host.IsDetached() || hf.hostLN == null)
+					{
+						continue;
+					}
+					Vector3 vH = hf.host.rb.velocity - wind;
+					float v2H = vH.sqrMagnitude;
+					if (v2H < 25f)
+					{
+						continue;
+					}
+					float qSH = 0.5f * rho * v2H * Acc.AP_wingArea(hf.host) * Acc.AP_wingEff(hf.host);
+					Quaternion h0 = hf.HostRot0;
+					Vector3 dFH = Camber.Delta(vH, h0, hf.HingeAxisWorld, Plugin.FlapCamberK, hf.hingeNow, hingeTables[j], qSH);
+					if (dFH.sqrMagnitude > 0f)
+					{
+						hf.host.rb.AddForceAtPosition(dFH, hf.host.rb.worldCenterOfMass + h0 * Acc.AP_centerOfLift(hf.host));
+					}
+				}
 			}
 			for (int i = 0; i < surfs.Count; i++)
 			{

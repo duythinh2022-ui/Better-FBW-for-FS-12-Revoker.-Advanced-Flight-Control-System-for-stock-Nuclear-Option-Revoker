@@ -9,7 +9,7 @@ namespace Revoker_FS12.FCS.Dev
 	// BepInEx/config/Revoker_FS12.FCS.Dev.cfg and shows them in the ConfigurationManager (F1).
 	// 0.2.3: once, it also copies the Revoker's wing / trailing-edge mesh data (8 meshes, 211,968 bytes) out of
 	// resources.assets.resS into BepInEx/Revoker_mesh.bin, so the hinge lines can be measured offline. Read-only on the game.
-	[BepInPlugin("Revoker_FS12.FCS.Dev", "FS-12 Revoker FCS - Dev/Debug settings", "0.2.9")]
+	[BepInPlugin("Revoker_FS12.FCS.Dev", "FS-12 Revoker FCS - Dev/Debug settings", "0.2.10")]
 	public class FcsDevPlugin : BaseUnityPlugin
 	{
 		private static readonly long[] Ranges = { 950215792, 13536, 974999984, 12864, 976021456, 45840, 1010250544, 45840, 1016096048, 33744, 1016957344, 12864, 1044269280, 33744, 1046155328, 13536 };

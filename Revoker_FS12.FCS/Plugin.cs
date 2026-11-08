@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -168,6 +168,20 @@ namespace Revoker_FS12.FCS
 
 		private static ConfigEntry<float> cSlipGainHi;
 
+		private static ConfigEntry<bool> cSlipGainLoops;
+
+		private static ConfigEntry<float> cActLag;
+
+		private static ConfigEntry<bool> cStagger;
+
+		private static ConfigEntry<float> cStallInner;
+
+		private static ConfigEntry<float> cStallOuter;
+
+		private static ConfigEntry<float> cStallSlope;
+
+		private static ConfigEntry<bool> cSlipGovLead;
+
 		private static ConfigEntry<bool> cDecHldFold;
 
 		private static ConfigEntry<float> cSlipHoldTas0;
@@ -248,6 +262,12 @@ namespace Revoker_FS12.FCS
 		public static float SlipPredictWashout => (cSlipPredW != null) ? Mathf.Clamp(cSlipPredW.Value, 0f, 10f) : 1.5f;
 
 		public static float SlipGainHighAoA => (cSlipGainHi != null) ? Mathf.Max(0f, cSlipGainHi.Value) : 4f;
+
+		public static bool SlipGainFromLoops => cSlipGainLoops == null || cSlipGainLoops.Value;
+
+		public static bool SlipGovLeadFromLoops => cSlipGovLead == null || cSlipGovLead.Value;
+
+		public static float ActuatorLagT => (cActLag != null) ? Mathf.Clamp(cActLag.Value, 0f, 0.5f) : 0.07f;
 
 		public static float SplitMu => (cSplitMu != null) ? Mathf.Max(1E-06f, cSplitMu.Value) : 1E-03f;
 
@@ -406,17 +426,24 @@ namespace Revoker_FS12.FCS
 
 		private static ConfigEntry<bool> cGovPred;
 
-		private static ConfigEntry<bool> cSweepYaw;
-
-		private static ConfigEntry<bool> cSweepPos;
-
-		private static ConfigEntry<float> cPullSlipMargin;
-
 		private static ConfigEntry<float> cPullRollTrade;
 
-		private static ConfigEntry<float> cPullFFBoostMax;
+		// Revoker FCS 0.3.0 (F-22E 2.6.0): the lateral reference governor's knobs (player config section 6) and the 2.4.18 yaw slew lead (Dev)
+		private static ConfigEntry<float> cRollStopSlip;
 
-		private static ConfigEntry<bool> cPullGovSmooth;
+		private static ConfigEntry<int> cGovRev;
+		private static ConfigEntry<float> cPushSlip;
+
+
+		private static ConfigEntry<bool> cYawSlewLead;
+
+		private static ConfigEntry<bool> cRollGovPitch;
+
+		private static ConfigEntry<bool> cRollStopSlipProbe;
+
+		private static ConfigEntry<float> cRollPaceRateSlip;
+
+		private static ConfigEntry<float> cRollPaceRateBlend;
 
 		private static ConfigEntry<float> cSplitFlapRollYield;
 
@@ -495,8 +522,6 @@ namespace Revoker_FS12.FCS
 		private static ConfigEntry<float> cCoupFF;
 
 		private static ConfigEntry<float> cRelPitchPrio;
-
-		private static ConfigEntry<float> cRelStabRate;
 
 		private static ConfigEntry<float> cWashSlew;
 
@@ -659,9 +684,7 @@ namespace Revoker_FS12.FCS
 
 		private static ConfigEntry<float> cAsymFFAoA;
 
-		private static ConfigEntry<float> cBetaGuard;
 
-		private static ConfigEntry<float> cYawSatGuard;
 
 		private static ConfigEntry<float> cLowQReg;
 
@@ -713,9 +736,9 @@ namespace Revoker_FS12.FCS
 
 		public static bool AIDirectRoll => cAIDirectRoll.Value;
 
-		public static float StabRangeTEUp => Mathf.Clamp(cStabUp.Value, 0f, 45f);
+		public static float StabRangeTEUp => Mathf.Clamp(cStabUp.Value, 0f, 80f);
 
-		public static float StabRangeTEDown => Mathf.Clamp(cStabDn.Value, 0f, 45f);
+		public static float StabRangeTEDown => Mathf.Clamp(cStabDn.Value, 0f, 80f);
 
 		public static float RudderRange => Mathf.Clamp((0f), 0f, 45f);
 
@@ -788,7 +811,7 @@ namespace Revoker_FS12.FCS
 
 		public static float LerxEffectiveness => (1f);
 
-		public static bool StallStagger => (false);
+		public static bool StallStagger => cStagger == null || cStagger.Value;
 
 		public static float LowThrustTW => cLowThrustTW.Value;
 
@@ -800,29 +823,31 @@ namespace Revoker_FS12.FCS
 
 		public static bool RollGovPredictiveOn => cGovPred == null || cGovPred.Value;
 
-		public static bool SweepYawLimitOn => cSweepYaw == null || cSweepYaw.Value;
-
 		public static bool SplitFlaperonYaw => cSplitFlapYaw == null || cSplitFlapYaw.Value;
 
 		public static float SplitFlaperonYawUse => cSplitFlapYawUse == null ? 1f : Mathf.Clamp(cSplitFlapYawUse.Value, 0f, 1f);
 
-		public static float PullSideslipMargin => cPullSlipMargin == null ? 15f : Mathf.Clamp(cPullSlipMargin.Value, 2f, 15f);
-
 		public static float SplitFlaperonRollYield => cSplitFlapRollYield == null ? 0f : Mathf.Clamp(cSplitFlapRollYield.Value, 0f, 1f);
-
-		public static bool PullGovSmooth => cPullGovSmooth == null || cPullGovSmooth.Value;
-
-		public static float PullFFBoostMax => cPullFFBoostMax == null ? 4f : Mathf.Clamp(cPullFFBoostMax.Value, 1f, 8f);
 
 		public static float PullRollTrade => cPullRollTrade == null ? 0.7f : Mathf.Clamp(cPullRollTrade.Value, 0f, 1f);
 
-		public static bool SweepPosOn => cSweepPos == null || cSweepPos.Value;
+		public static float RollStopSideslip => cRollStopSlip == null ? 6f : Mathf.Clamp(cRollStopSlip.Value, 1f, 15f);
+
+		public static float PushoverSideslip => cPushSlip == null ? 8f : (cPushSlip.Value < 0f ? RollStopSideslip : Mathf.Clamp(cPushSlip.Value, 0f, 20f));
+
+		public static bool RollGovernorPitch => cRollGovPitch == null || cRollGovPitch.Value;
+
+		public static bool RollStopSlipProbe => cRollStopSlipProbe == null || cRollStopSlipProbe.Value;
+
+		public static float RollPaceRateBlend => (cRollPaceRateBlend == null) ? 1f : Mathf.Clamp01(cRollPaceRateBlend.Value);
+
+		public static float RollPaceRateSlip => (cRollPaceRateSlip == null) ? 1f : Mathf.Clamp(cRollPaceRateSlip.Value, 0.5f, 3f);
+
+		public static bool YawSlewLead => cYawSlewLead == null || cYawSlewLead.Value;
 
 		public static bool StabsPitchOnly => cStabsPitchOnly != null && cStabsPitchOnly.Value;
 
 		public static float RollPitchLead => cRollPitchLead == null ? 0.25f : Mathf.Clamp(cRollPitchLead.Value, 0f, 0.6f);
-
-		public static bool SweepPosLimitOn => SweepYawLimitOn && SweepPosOn;
 
 		public static bool SlatRollReliefOn => cSlatRelief != null && cSlatRelief.Value;
 
@@ -876,16 +901,18 @@ namespace Revoker_FS12.FCS
 
 		public static float StabStallAoA => (25f);
 
-		public static float InnerFlaperonStallAoA => (35f);
+		public static float InnerFlaperonStallAoA => (cStallInner != null) ? Mathf.Clamp(cStallInner.Value, 20f, 80f) : 26f;
 
-		public static float OuterFlaperonStallAoA => (45f);
+		public static float OuterFlaperonStallAoA => (cStallOuter != null) ? Mathf.Clamp(cStallOuter.Value, 10f, 80f) : 45f;
 
-		public static float StallStaggerLiftSlope => (0f);
+		public static float StallStaggerLiftSlope => 0f;
 
 		public static bool RollFightReleased => cRollFightRel == null || cRollFightRel.Value;
 
 		// Ifrit: the F-22E's speedbrake fade (2.2.16) works on Aryx's Airbrake components; the Ifrit has none
 		public static bool AirbrakeAoAFade => false;
+
+		public static bool TeBrakeAoAFade => cTeBrakeFade == null || cTeBrakeFade.Value;
 
 		public static float AirbrakeFadeShareFull => 0.4f;
 
@@ -918,8 +945,6 @@ namespace Revoker_FS12.FCS
 		public static float CouplingFF => cCoupFF.Value;
 
 		public static float ReleasedPitchPriority => cRelPitchPrio.Value;
-
-		public static float ReleasedStabRateBound => Mathf.Max(0f, cRelStabRate.Value);
 
 		public static float RollNozzleWashoutSlew => Mathf.Max(0f, cWashSlew.Value);
 
@@ -1099,6 +1124,8 @@ namespace Revoker_FS12.FCS
 		private static ConfigEntry<float> cFuelTrimRate;
 
 		private static ConfigEntry<bool> cTeBrake;
+
+		private static ConfigEntry<bool> cTeBrakeFade;
 
 		private static ConfigEntry<float> cGbElev, cGbInb, cGbCan, cAbElevUp, cAbInbDn;
 
@@ -1368,9 +1395,7 @@ namespace Revoker_FS12.FCS
 
 		public static float AsymFFMaxAoA => cAsymFFAoA.Value;
 
-		public static float SideslipGuardStart => cBetaGuard.Value;
 
-		public static float YawSatGuard => Mathf.Clamp01(cYawSatGuard.Value);
 
 		public static float LowQRegRelief => cLowQReg.Value;
 
@@ -1392,7 +1417,7 @@ namespace Revoker_FS12.FCS
 
 		public static float GroundBrakeInboard => (cGbInb != null) ? Mathf.Clamp(cGbInb.Value, 0f, 25f) : 25f;
 
-		public static float GroundBrakeStab => (cGbCan != null) ? Mathf.Clamp(cGbCan.Value, 0f, 45f) : 45f;
+		public static float GroundBrakeStab => (cGbCan != null) ? Mathf.Clamp(cGbCan.Value, 0f, 80f) : 80f;
 
 		public static float GroundBrakeRudder => (25f);
 
@@ -1487,6 +1512,9 @@ namespace Revoker_FS12.FCS
 			cAIGunRollFade = cfg.Bind("2. AI", "AIGunRollFade", defaultValue: true, "AI Revokers only: while the AI points its nose (guns) at a moving target, its roll stick is faded out when the aim error is small, so it does not wobble the gun solution.");
 			cAoAPos = dev.Bind("2. Envelope", "AoALimitPositive", 70f, "AoA limit (deg) in AoA/G command and gear-down rate command. Revoker 0.2.0: 70 (F-22E/Ifrit 65). Bench, full aft + full roll at the limit, 300/450 km/h: 65 -> 5.3/5.6 deg max sideslip, 70 -> 12.7/9.9, 75 -> 23/22, 80 -> 37/35, 90 -> 44/36. The pitch axis holds to 90 (yaw TVC); past 70-75 the body-roll authority a velocity-vector roll needs runs out (all four elevons and the canards saturated), so 70 is the highest that keeps a loaded roll inside 15 deg of sideslip.");
 			cAoANeg = dev.Bind("2. Envelope", "AoALimitNegative", 55f, "Negative AoA limit magnitude (deg), with the nozzle covering pitch. Revoker 0.2.7: 55 (canards at +-45 kept in their attached flow, CanardAttachedWindow; bench, full push + roll / pedal at 150-300 km/h, light and full fuel: -55 holds with sideslip <= 4.4 deg and 69-78 deg/s velocity-vector roll, -60 held too with up to 7.6 deg of sideslip on pedal; -50 before 0.2.7 gave 63-73 deg/s). Revoker 0.1.0: 50 (the F-22E's hard limit). Bench, 500 km/h full thrust: canards + TVC still hold ~+100 deg/s^2 of nose-up margin at -50..-60.");
+			cStagger = dev.Bind("5. Airframe", "ElevonStallStagger", true, "Revoker 0.2.20 (0.2.22: knee-preserving): staggered stall of the two trailing-edge elevon pairs. Both use the wing foil (Fighter1_wing: lift knee 17 deg, peak 44.6 deg local AoA), so without this both reverse for velocity-vector roll at ~45 deg together. Each pair gets its own copy of the curve with the peak moved to InnerElevonReversalAoA / OuterElevonReversalAoA (both signs); the game's aero (the parts' charts) and the FCS's models use the same curves. The inboard pair's camber share on wing2 is applied as a force on that curve, so it reverses with the elevon (wing2's own clean lift keeps the wing curve). Takes effect on the next spawn. false = 0.2.19.");
+			cStallInner = dev.Bind("5. Airframe", "InnerElevonReversalAoA", 26f, "Revoker 0.2.22: 26 (0.2.21: 37, 0.2.20: 32; migrated once). Inboard elevon (flap_L/R) lift-peak local AoA (deg, 20-80) with ElevonStallStagger. 0.2.22 moves only the plateau above the wing foil's 17.2 deg knee (the curve below it and the 1.10 peak CL are untouched). Model, outboard at 45, both pairs + camber, measured arms: 26 maximises the worst-case velocity-vector roll authority over 10-55 deg (0.26 small / 0.18 full deflection, vs 0.03 / 0.01 unstaggered); the inboard pair reverses at ~27.7 (33.2 at full deflection) and is flown reversed from there. Next spawn.");
+			cStallOuter = dev.Bind("5. Airframe", "OuterElevonReversalAoA", 45f, "Revoker 0.2.20: outboard elevon (aileron_L/R) lift-peak local AoA (deg) with ElevonStallStagger. 45 = the wing foil's own (44.6). Next spawn.");
 			cFlapCamber = dev.Bind("5. Airframe", "FlapCamberCoupling", 0.46f, "Revoker 0.2.0: the inboard elevon (flap_L/R) also cambers the wing2 section ahead of it: wing2's lift normal turns by K x the flap deflection (the stock HLD turns it 4 deg for 25, K 0.16). Thin-airfoil effectiveness of the 0.24-chord flap (1.2 of 4.9 m) is 0.60; host share (0.60 x 5.2 - 1.4) / 3.8 = 0.46. 0 = off.");
 			cAilCamber = dev.Bind("5. Airframe", "AileronCamberCoupling", 0.45f, "Revoker 0.1.0: the outboard elevon (aileron_L/R) also cambers the wingtip section ahead of it: the wingtip's lift normal turns by K x the deflection. Thin-airfoil effectiveness of the 0.30-chord surface (1.02 of 3.41 m) is 0.66; host share (0.66 x 5.25 - 2.0) / 3.25 = 0.45. 0 = off.");
 			cLatMargin = cfg.Bind("1. General", "HighAoALateralBrakeMargin", 0.86f, new ConfigDescription("High-AoA lateral braking margin. Above HighAoALateralMarginFull (30 deg AoA, dev cfg) the roll- and yaw-rate limits are multiplied by this, blended in smoothly from HighAoALateralMarginStart (25). 0.86 = 14 % less allowed stop time: 14 % less roll and yaw rate for the same authority, the rotation stops sooner. 1 = 0.3.0. Takes effect at once.", new AcceptableValueRange<float>(0.5f, 1.5f)));
@@ -1501,6 +1529,9 @@ namespace Revoker_FS12.FCS
 			cTvcRollNeutral = dev.Bind("4. Gains", "TvcRollNeutralHold", false, "Ifrit 0.3.0, default OFF: on the bench any weight here makes the released-stick pitch hold sluggish (q -0.3 deg/s bleeding off over ~7 s in level flight at 400 km/h, the stabs held still), an interaction with the roll-fight cost. TvcNeutralHold for the differential (roll) nozzles. With the lateral stick and pedals centred, the roll on its command and the sideslip under 2 deg, the nozzles go back to symmetric and the wing surfaces hold the roll trim; any roll input, roll error or sideslip frees them at once. false = 0.2.2.");
 			cTvcRollNeutralW = dev.Bind("4. Gains", "TvcRollNeutralWeight", 30f, "Ifrit 0.3.0: cost weight of TvcRollNeutralHold.");
 			cSlipGainHi = dev.Bind("3. Lateral-directional", "SlipGainHighAoA", 4f, "Ifrit 0.3.0 (SlipTvcAssist): the sideslip gain (KBeta) ramps to this from 25 to 45 deg AoA, where the correction is mostly body roll from the nozzles. Bench, 65 deg corkscrew, 1 s full-pedal kick: back under 3 deg in 4.3-4.7 s at 1.3, 0.5-0.8 s at 4. Below 25 deg KBeta applies as before.");
+			cSlipGainLoops = dev.Bind("3. Lateral-directional", "SlipGainFromLoops", true, "Revoker 0.2.14: the sideslip-hold gain is what the rate loops carrying the correction can follow, instead of the fixed SlipGainHighAoA ramp. The correction rS is flown as body yaw rS cos(AoA) through the yaw-rate loop (YawRateGain, 2.5/s = 0.4 s) and as body roll -rS sin(AoA) through the roll-rate loop (RollRateGain, 6/s = 0.17 s), each plus the actuator lag (ActuatorLagT). The sideslip loop closes through them as gain/s x lag, so its phase margin is gain x lag: the gain is SideslipGain x (yaw-loop lag / the cos^2-sin^2 weighted lag of the two paths), and a path that would have to deliver its share beyond the spare authority of its axis counts the time that takes instead. 0 deg AoA: exactly SideslipGain (1.3); -50: ~1.85; 70: ~2.3. The 30 Oct 22:48 log flew the Revoker's push + roll at the fixed 4 through the 0.4 s yaw loop: ~15 deg of phase margin, sideslip -3.4 <-> +3.6 at 1 Hz, yaw rate +-12 deg/s about its command, rudder stop to stop, the roll governor cutting twice (the hitch); the F-22E, at 1.3 there, recovers -6.8 deg in one move. false = the SlipGainHighAoA ramp (0.2.13).");
+			cActLag = dev.Bind("3. Lateral-directional", "ActuatorLagT", 0.07f, "Revoker 0.2.14: command-to-surface lag (s) the SlipGainFromLoops gain counts on top of each rate loop's 1/gain (30 Oct 22:48 log: rudder and canard command lead their position by 0.07 s, the yaw nozzle by 0.02).");
+			cSlipGovLead = dev.Bind("3. Lateral-directional", "SlipGovLeadFromLoops", true, "Revoker 0.2.15: the push + roll sideslip governor looks ahead as far as the lateral loops take to answer (the SlipGainFromLoops lag, 0.33-0.47 s) instead of a fixed 0.8 s. 30 Oct 23:45 log (0.2.14), push + roll at -42 deg AoA: the sideslip crossing zero at +11 deg/s on its way back from -3.3 deg (the hold's own recovery, peak +2.4) read as +9 deg 0.8 s out and cut the roll target 79 -> 46 deg/s; the roll braked, the yaw command fell with the yaw nozzle and rudder on their stops, the yaw rate overran by 6 deg/s and the nozzle went stop to stop, then the release 0.35 s later re-built the roll 46 -> 85 and it went round again. Over the loops' own lag that crossing projects to 3.6 deg: no cut. false = 0.8 s (0.2.14). Needs SlipGainFromLoops.");
 			cSlipLimTas0 = dev.Bind("3. Lateral-directional", "RollSlackMinTAS", 25f, "Ifrit 0.3.9: below this true airspeed (m/s) the roll is not held back for sideslip or yaw coordination (sideslip guard / governor, yaw-anchored roll limit, roll-acceleration coordination cap); they come back in over RollSlackTASSpan (smoothstep) and are off past 120 deg |AoA|. Higher = more roll slack at low speed, more sideslip.");
 			cSlipLimTasSpan = dev.Bind("3. Lateral-directional", "RollSlackTASSpan", 50f, "Ifrit 0.3.9: m/s over which the roll limiters come back in above RollSlackMinTAS (default: full from 75 m/s TAS, 270 km/h). Bench, full stick from near zero airspeed accelerating to 250 km/h: 25/50 holds 21-44 deg/s where 20/30 sat at 11 deg/s; corkscrew from 150 km/h and slow rolls unchanged.");
 			cSlipHoldTas0 = dev.Bind("3. Lateral-directional", "SlipHoldMinTAS", 15f, "Ifrit 0.3.7: the sideslip hold is off below this true airspeed (m/s) and fades in over SlipHoldTASSpan; it also fades out from 100 to 120 deg |AoA| (flying backwards). Pedals keep commanding yaw there. In tail slides and near zero airspeed the hold asked for yaw it had no authority for: the jet swayed left/right and the roll stick was scaled to nothing. 0 = 0.3.6 at speed (reversed-flow fade still applies).");
@@ -1565,8 +1596,6 @@ namespace Revoker_FS12.FCS
 			cCouple = dev.Bind("3. Lateral-directional", "CoupledAxisAoA", 36f, "Above this |AoA| the pedals blend into the stick's velocity-vector roll (full coupling 14 deg higher).");
 			cPedalBeta = dev.Bind("3. Lateral-directional", "PedalSideslip", 15f, "Sideslip commanded by full pedal below the coupling AoA (deg).");
 			cRollAcc = dev.Bind("3. Lateral-directional", "MaxRollAccel", 720f, "Ceiling on the shaped velocity-vector roll acceleration (deg/s^2); below it the measured authority sets the rate.");
-			cBetaGuard = dev.Bind("3. Lateral-directional", "SideslipGuardStart", 4f, "Sideslip error (deg) above which the velocity-vector roll/yaw command is backed off, fading to zero command 10 deg above it. Raise it for manoeuvres that live at large sideslip on purpose (falling leaf); lower it for tighter coordination.");
-			cYawSatGuard = dev.Bind("3. Lateral-directional", "YawSaturationGuard", 0.7f, "How hard a yaw-saturated allocation backs the roll/yaw command off (0..1, fraction removed at full saturation). Lower = the command stays up when the surfaces cannot fully deliver it (more sideslip, more yaw rate); 0 = off.");
 			cKBeta = dev.Bind("4. Gains", "SideslipGain", 1.3f, "Stability-axis yaw rate per degree of sideslip error (1/s).");
 			cKRoll = dev.Bind("4. Gains", "RollRateGain", 6f, "Roll-rate loop bandwidth (1/s).");
 			cKPitch = dev.Bind("4. Gains", "PitchRateGain", 5f, "Pitch-rate loop bandwidth (1/s).");
@@ -1581,12 +1610,7 @@ namespace Revoker_FS12.FCS
 			cLeadK = dev.Bind("4. Gains", "StickLeadGain", 0f, "2.1.7: G + pitch-rate law only. Extra pitch-rate command on stick movement, washed out over StickLeadTau: a quick small input moves the nose a little at once, like an AoA step, then the plain rate response takes over; a held stick gets none. 0 = off (default). Around 1 = noticeable crispness; much above 1.5 small inputs can feel twitchy. Takes effect at once.");
 			cLeadTau = dev.Bind("4. Gains", "StickLeadTau", 0.15f, "2.1.7: wash-out time (s) of StickLeadGain. Longer = the extra nose movement lasts longer and is larger for the same gain.");
 			cGovPred = dev.Bind("3. Lateral-directional", "PredictiveRollGovernor", true, "2.1.5: the roll governor (1.8.41, keeps nozzle margin for pitch during rolls) looks at where the nozzle margin is heading 0.4 s ahead and eases the roll off early and in proportion, instead of cutting it once the nozzles are already pinned and restoring it a second later (the roll hitch). It comes back only when the margin is there and no longer falling. false = 2.1.4. Takes effect at once.");
-			cSweepYaw = dev.Bind("3. Lateral-directional", "AoASweepYawLimit", true, "2.1.8: while the jet carries a velocity-vector roll, the AoA may only sweep as fast as the yaw and roll axes can re-point the rate vector to follow it (a roll at AoA a needs a yaw rate of p sin a; sweeping a under that roll turns the yaw rate already there into sideslip). Mainly a full push right after a high-AoA roll at low IAS. No effect with no roll, and none beyond the AoA limits (protection keeps its own rate). false = off (no AoA-sweep limit). Takes effect at once.");
-			cSweepPos = dev.Bind("3. Lateral-directional", "AoASweepYawLimitPositive", true, "2.2.7: positive-AoA pulls while rolling: the AoA rise is held to what the yaw can follow, and tapered to a hold as the sideslip (and where it is heading) approaches PullSideslipMargin, on the side the AoA rise drives it. Acts from ~10 deg/s of roll (full by 20). Pulls without roll and steady-AoA rolls are unaffected. Needs AoASweepYawLimit on. false = no positive-AoA limit (2.2.3). Takes effect at once.");
-			cPullSlipMargin = dev.Bind("3. Lateral-directional", "PullSideslipMargin", 15f, "Ifrit 0.3.1: default 15 (0.3.0: 9). Bench, corkscrew entry at 475 km/h: at 9 the governor held the AoA near 20 deg while the roll settled (the hitch). 2.2.7 (2.2.8: uses the full margin; 2.2.23: default 6 -> 9): sideslip (deg) the AoA-rise governor in a rolling pull runs up to. The AoA rises as fast as the yaw can follow, tapers from 70 % of the margin (2.2.7: 35 %) and holds at it; past it the AoA comes back down. Judged on the sideslip and where it is heading 0.3 s ahead. Allowed 2-15: lower = tighter sideslip, slower AoA build-up while rolling. Takes effect at once.");
-			cPullRollTrade = dev.Bind("3. Lateral-directional", "PullRollTrade", 0.7f, "2.2.8 (2.2.23: default 0 -> 0.7; 2.2.26: 1; 2.2.27: back to 0.7): in a rolling pull held back by the sideslip governor, how much of the AoA rise you ask for is bought back by slowing the roll (the sideslip a rising AoA makes goes as roll rate x AoA rate). 0 = roll kept, AoA rise limited (2.2.7). 1 = roll slowed (to no less than 30 deg/s) until the asked AoA rise fits the sideslip margin; in between, the roll limit goes that share of the way. The roll comes back once the AoA rise is no longer limited. 2.2.11: above ~180-230 kt (2.2.12; 2.2.11: 230-280) the roll limit is also set ahead of time from the AoA rate the stick asks for, so the roll does not build past what the yaw can coordinate before the governor reacts. Takes effect at once.");
-			cPullFFBoostMax = dev.Bind("3. Lateral-directional", "PullFFBoostMax", 4f, "2.2.24: in a rolling pull, the governor's yaw-authority feed-forward (how fast the AoA may rise for the roll in force) is scaled up to this many times while the sideslip stays under half of PullSideslipMargin and the stick asks for more, and scaled back as the sideslip passes 70 % of it; the sideslip taper still holds the margin. Off with a fin lost. 1 = off (2.2.23: the feed-forward alone held the AoA rise to ~10 deg/s at 100-125 kt with 1-4 deg of a 9 deg margin). Allowed 1-8. Takes effect at once.");
-			cPullGovSmooth = dev.Bind("3. Lateral-directional", "PullGovSmooth", true, "2.2.9: rolling-pull governor without the yaw-lead release, and its pitch-rate cap comes back over ~0.3 s instead of at once. Removes most of the pitch bounce when pulling with lateral stick, but full aft + full roll together from wings level builds AoA more slowly (bench 450 km/h: 39 -> 21 deg at 4 s); PullRollTrade buys that back. false = 2.2.8 (faster AoA in pull + roll together, bouncier). Takes effect at once.");
+			cYawSlewLead = dev.Bind("3. Lateral-directional", "YawSlewLead", true, "F-22E 2.4.18 (ported in Revoker FCS 0.3.0): the yaw-rate loop looks ahead along the measured yaw acceleration by the time the rudders need to swing back through neutral (their deflection / servo rate), so it starts braking the yaw before the yaw rate reaches its command instead of overshooting it (F-22E 22:36 log, 52 s: yaw rate 42 against 28, sideslip -12 on the reversal). No effect with the rudders near neutral; fades out from 36 to 45 deg AoA. false = off. Takes effect at once.");
 			cSplitFlapYaw = dev.Bind("3. Lateral-directional", "SplitFlaperonYaw", true, "2.2.7: decelerons. When the yaw needed is past what the rudders can give (both fins gone, one fin gone, or one engine out with the other's thrust more than the rudders hold), the inner and outer flaperons on one wing open against each other (their rolls cancel, their drag yaws the jet), up to SplitFlaperonYawUse of the drag yaw they have. Only the part the rudders cannot cover; the engine-out VMC throttle limit acts after it. false = 2.2.6 (yaw target limited to the rudders). Takes effect at once.");
 			cSplitFlapYawUse = dev.Bind("3. Lateral-directional", "SplitFlaperonYawUse", 1f, "2.2.19: default 1 (was 0.7). Bench, both fins gone, full roll held at 25-40 deg AoA: worst sideslip mean 12.4 -> 10.8 deg, roll tracking unchanged. 2.2.7: share (0-1) of the flaperons' remaining drag yaw the deceleron split may ask for. Higher = more yaw, more roll and pitch disturbance from the split. Takes effect at once.");
 			cSplitFlapRollYield = dev.Bind("3. Lateral-directional", "SplitFlaperonRollYield", 0f, "2.2.8: how much of the deceleron split gives way to lateral stick (the split's reach shrinks by this x |lateral stick|, held 1 s after the stick returns). 0 = split kept through rolls (as 2.2.7; least sideslip). 1 = no split while rolling (roll tracks more evenly, but with both fins gone the sideslip in rolls runs much higher, e.g. 15 -> 27 deg replaying your 19 Oct 338-362 s inputs on the bench). Takes effect at once.");
@@ -1607,6 +1631,15 @@ namespace Revoker_FS12.FCS
 			cStick24 = cfg.Bind("5. Pitch stick curve", "StickFor24degAoA", 0.6f, "2.0.12 (default 0.6 since 2.0.15; 0.45 in 2.0.13-2.0.14): pull-stick position (0..1) that commands 24 deg AoA. 0.333 = the standard 72 deg per full stick line. Allowed 0.083-0.7: lower = more AoA early in the pull (sharper), higher = less (softer, finer control at low AoA). The curve through 0, this point and the 36 deg point is smooth (monotone cubic), so the gain changes gradually instead of at a corner. Takes effect at once.");
 			cStick36 = cfg.Bind("5. Pitch stick curve", "StickFor36degAoA", 0.8f, "2.0.12 (default 0.8 since 2.0.15; 0.65 in 2.0.13-2.0.14): pull-stick position (0..1) that commands 36 deg AoA (on the standard line: 0.5). Allowed 0.3-0.8, and always at least 0.1 of stick past StickFor24degAoA (if set closer it is moved out to 24's point + 0.1, so 36 can never come at or before 24). Past 36 the curve continues to the AoA limit at full stick as before (the high-AoA rate hand-over is unchanged). Applies to the pull side; the push side keeps the 72 deg per stick line. Takes effect at once.");
 			cStickRev = cfg.Bind("5. Pitch stick curve", "StickCurveRevision", 2, "Internal: the stick-curve default revision this file was last updated to. Leave it alone.");
+			// Revoker FCS 0.3.0 (F-22E 2.6.0): the lateral reference governor's knobs live in the player config; PullRollTrade moves here from the Dev file (its value carried over once)
+			cPullRollTrade = cfg.Bind("6. Lateral governor", "PullRollTrade", 0.7f, "2.2.8 (2.2.23: default 0 -> 0.7; 2.2.26: 1; 2.2.27: back to 0.7): in a rolling pull the yaw cannot keep up with, how much of the shortfall is paid by slowing the roll and how much by slowing the AoA rise (the sideslip a rising AoA makes goes as roll rate x AoA rate). 0 = roll kept, AoA rise limited. 1 = roll slowed (to no less than 30 deg/s) until the asked AoA rise fits; in between, the roll limit goes that share of the way and the pitch covers the rest (F-22E 2.6.4/2.6.5). The roll comes back once the AoA rise is no longer limited. Takes effect at once.");
+			cRollStopSlip = cfg.Bind("6. Lateral governor", "RollStopSideslip", 6f, "Revoker FCS 0.7.0: default 8 -> 6 (Tom, 5 Nov 01:10: roll reversals at low to mid AoA made 7-9 deg, the margin spent in every one; 2 deg less, at some roll rate there). Revoker FCS 0.4.0: default 8 (the F-22E flies 4). From your 30-31 Oct logs the old lateral stack ran this jet at 7-8 deg (95th percentile) of sideslip above 45 deg AoA and 2.6-3.3 at 15-45, and the rates you were used to came with that; the governor at 4 kept the sideslip to 2-4 and took the yaw rate in the falling leaf from 77 to 54 and the moderate-AoA roll from 64 to 46 deg/s (Revoker 0.3.0 flight). 8 is where this jet was; lower = cleaner stops, slower rolls. F-22E 2.4.17 (2.5.0: 3 -> 4): sideslip (deg) a roll stop or reversal is allowed to make; the lateral governor caps the commanded roll rate (never the roll acceleration or braking) to the rate whose full stick reversal the yaw can follow within it. The one margin at every AoA (no schedule); the airframe probe (RollStopSlipProbe) can only lower it. A handling (sway) number: lower = slower rolls at moderate AoA, cleaner stops. Allowed 1-15. Takes effect at once.");
+			cGovRev = cfg.Bind("6. Lateral governor", "GovernorRevision", 0, "Internal: the lateral-governor default revision this file was last updated to. Leave it alone.");
+			cRollGovPitch = cfg.Bind("6. Lateral governor", "RollGovernorPitch", true, "F-22E 2.5.2, rebuilt 2.5.3-2.6.6: roll first, then pitch, both ways. With the roll already held to its cap, the AoA rate the pitch law may command under the roll is held to what the yaw can pay for: an AoA sweep changes the yaw the pair needs at roll rate x cos AoA x AoA rate. Nose-up at positive AoA: 0.8 x the rudders' braking yaw not yet in use on the roll's side, faded in with the rudders' braking yaw and only as the forecast sideslip heads past 75 % of the margin - a rolling pull that pins the rudders but holds its sideslip keeps its pitch rate. Every other sweep (nose-down anywhere, nose-up from negative AoA): 0.5 x the yaw authority plus half the roll's, from the same rule, at every IAS; a sweep toward zero AoA under a body yaw rate is paced so the yaw that will have nothing to coordinate at zero AoA is shed first (weighted by 1 - cos AoA, so the nose is let through near zero). Never under 6 deg/s of AoA rate; released over 0.3 s. false = the trade alone. Takes effect at once.");
+			cRollPaceRateSlip = cfg.Bind("6. Lateral governor", "RollPaceRateSlip", 1f, new ConfigDescription("F-22E 2.5.10: how much of the sideslip margin the roll-rate cap spends - the roll rate / sideslip compromise. 1 = the cap aims a full stick reversal at the margin as set. Above 1 the cap aims past the margin and lets the roll run faster (F-22E bench, margin 15: worst / mean sideslip and mean roll rate 5.8 / 3.9 at 52 deg/s for 1.0, 8.3 / 4.8 at 59 for 1.25, 10.7 / 6.3 at 67 for 1.67, 13.0 / 7.6 at 74 for 2.0, against 10.9 / 8.0 at 83 with no cap); the game's worst held-roll reversal reads about 1.4x the bench's. Below 1 the cap is stricter than the margin. Allowed 0.5-3. Takes effect at once.", new AcceptableValueRange<float>(0.5f, 3f)));
+			cRollPaceRateBlend = cfg.Bind("6. Lateral governor", "RollPaceRateBlend", 0.65f, new ConfigDescription("Revoker FCS 0.8.1: default 0.4 -> 0.65 (Tom, 5 Nov 01:40: low to mid AoA roll sideslip somewhere between 0.5.1 and 0.8.0). F-22E 2.5.11: how the pace governor splits its work between its two laws. 0 = pacing only (the yaw-reach window holds the roll target while the yaw catches up and the trajectory's acceleration / braking is capped at the yaw's authority: reversals are paced, the margin does not matter). 1 = rate cap only (the target is capped at the rate whose stick reversal lands on the sideslip margin x RollPaceRateSlip; acceleration and braking stay as tuned: reversals are crisp, the rate is lower). Between: the proportional mix of the two targets, and the acceleration cap gives way to the tuned acceleration in the same proportion. The F-22E flies at ~0.4. Allowed 0-1. Takes effect at once.", new AcceptableValueRange<float>(0f, 1f)));
+			cRollStopSlipProbe = cfg.Bind("6. Lateral governor", "RollStopSlipProbe", true, "F-22E 2.5.15/2.5.16: the airframe's own sideslip tolerance, measured from its aero tables in flight - no number entered. Twice a second the FCS evaluates the whole airframe (every aero part at the game's per-part law, the surfaces where they are) at the present AoA and a sweep of hypothetical sideslip to 20 deg each way, and finds the sideslip where the restoring yaw moment stops growing (directional stiffness gone - the departure boundary) and where the yaw effectors' or the roll surfaces' authority has fallen to half of its zero-sideslip value. The smaller, x 0.7, caps RollStopSideslip. On an airframe with nothing inside 20 deg the cap never binds and RollStopSideslip rules; on one with a soft fin it binds where the fin gives out. Telemetry: slipTol / slipDep / slipAuth / slipStiff. false = RollStopSideslip alone. Takes effect at once.");
+			cPushSlip = cfg.Bind("6. Lateral governor", "PushoverSideslip", 8f, "Revoker 0.6.0 (the F-22E 3.0.0 push governor and push plan): 8, set explicitly (Tom, 4 Nov: the stock jets' RollStopSideslip, not the F-22E's 4); -1 = follow RollStopSideslip. F-22E 2.9.4: sideslip (deg) a push-over from high AoA may make at the zero crossing from the yaw rate still on board. The sweep is paced so the yaw above what that allowance can absorb (r = sqrt(2 x measured shed x allowance)) is shed before the AoA reaches zero; the rest is left to the rudders at low AoA. Higher = faster nose-down with a high yaw rate on, more sideslip at the bottom. -1 = RollStopSideslip. 0-20. Takes effect at once.");
 			if (cStickRev.Value < 1)
 			{
 				// 2.0.13: new defaults 0.45 / 0.65; a file still holding 2.0.12's 0.333 / 0.5 is moved once
@@ -1656,10 +1689,11 @@ namespace Revoker_FS12.FCS
 			cRollFightRel = dev.Bind("4. Gains", "RollFightReleased", true, "2.2.16: the roll-fight cost (RollFightCost) also acts while the lateral stick is centred, not only with the pedals in. With the stick released, a crossed set of surfaces - one stab split against the flaperons, ailerons and rudders, all near their stops, their roll cancelling - could hold for 10-15 s (19 Oct 18:05 / 18:32 logs, TVC off). false = 2.2.15. Takes effect at once.");
 			cGndBrakeSplit = dev.Bind("7. Airbrake", "AirbrakeSplitInFlight", defaultValue: true, "In the AIR, the brake control deploys the airframe's split surfaces (the stock speedbrake mechanism). On the ground they stay stowed and the airbrake is the rollout surface configuration alone. The stock rule deployed them whenever the throttle was at idle, airborne as well as on the ground; the FCS drives them now, so idle throttle deploys nothing. false = split surfaces never deploy.");
 			cAbElevUp = dev.Bind("7. Airbrake", "AirbrakeOutboardElevonUp", 20f, "Revoker 0.2.8 (TrailingEdgeBrakeConfig): outboard elevons trailing edge up with the airbrake out in the air, as the F-22E's ailerons. 0.2.9: the deflection is solved every frame so that the set adds no lift (with the canards' re-trim of its pitch counted): 14-19 deg on the bench at 400-1200 km/h. This key only switches the outboard share on (> 0) or off (0); 0.2.8 used it as a fixed deflection. The differential stays free for roll.");
+			cTeBrakeFade = dev.Bind("7. Airbrake", "TrailingEdgeBrakeAoAFade", true, "Revoker 0.2.10 (TrailingEdgeBrakeConfig): the in-flight elevon brake set closes with AoA as the F-22E's speedbrake does (its AirbrakeAoAFade: full to ~15 deg AoA, half at ~25, stowed past ~35 on the clean jet): full to 15 deg |AoA|, closing linearly to stowed at 35, reopening as the AoA comes back. false = 0.2.9 (always the full set with the brake held). Takes effect at once.");
 			cAbInbDn = dev.Bind("7. Airbrake", "AirbrakeInboardElevonDown", 25f, "Revoker 0.2.8 (TrailingEdgeBrakeConfig): inboard elevon trailing-edge-down deflection (deg, of 25) with the airbrake out in the air, as the F-22E's flaperons.");
 			cGbElev = dev.Bind("7. Airbrake", "GroundBrakeOutboardElevon", 30f, "Revoker 0.2.8 (TrailingEdgeBrakeConfig): outboard elevon trailing-edge-up deflection (deg, of 30) in the rollout aero-brake.");
 			cGbInb = dev.Bind("7. Airbrake", "GroundBrakeInboardElevon", 25f, "Revoker 0.2.8 (TrailingEdgeBrakeConfig): inboard elevon trailing-edge-up deflection (deg, of 25) in the rollout aero-brake.");
-			cGbCan = dev.Bind("7. Airbrake", "GroundBrakeCanard", 45f, "Revoker 0.2.8 (TrailingEdgeBrakeConfig): canard leading-edge-down deflection (deg, of 45) in the rollout aero-brake: drag, and a nose-down moment that keeps the nose wheel loaded.");
+			cGbCan = dev.Bind("7. Airbrake", "GroundBrakeCanard", 80f, "Revoker 0.2.18: 80 (0.2.8-0.2.17: 45; migrated once). Canard leading-edge-down deflection (deg) in the rollout aero-brake: drag, and a nose-down moment that keeps the nose wheel loaded. Capped by the canard's leading-edge-down travel (StabilatorRangeTEUp, 70), so 80 = all the way down. With 45 the brake alone stopped at 45 of the 70 and only brake + push reached the stop.");
 			cRotMinSpeed = dev.Bind("Ground", "RotationMinSpeed", 45f, "The take-off/landing rotation law (closed-loop pitch with the mains on the ground) only arms above this TAS (m/s). It used to arm at 15 m/s, an ordinary taxi speed, where it flew closed-loop pitch against the ground constraint and threw the surfaces about. It disarms 8 m/s below this.");
 			cGroundRate = dev.Bind("Ground", "GroundRateLaw", defaultValue: true, "2.0.6: on the runway above RotationMinSpeed, pulling the stick hands pitch to the same rate law as gear-down flight, held through the rotation and lift-off (the rate command, its limits and stick scaling are the airborne ones). Stick neutral or forward with all three wheels down for 0.3 s goes back to the open-loop ground mode (steering, aero-brake). false = 2.0.5 behaviour (open-loop stick until the nose is up, then RotationRate).");
 			cGroundRotRamp = dev.Bind("Ground", "GroundRotationRamp", 600f, "Revoker 0.2.9: 600 (F-22E 60). At 60 the nose stayed on the wheel for 0.7-0.85 s after a full pull at 200-320 km/h on the bench (in game, 29 Oct 00:25 log at 283 km/h: two full pulls of 0.45 s each did not lift it); at 600 it lifts in 0.16-0.20 s, with the same or smaller pitch-rate overshoot after lift-off. 2.0.6: while the nose wheel still touches in the ground rate law, the nose-up pitch moment the FCS asks for may grow by at most this much per second (in deg/s^2 of pitch acceleration). Stops the surfaces winding to full deflection against the nose leg and over-rotating when it lifts.");
@@ -1705,7 +1739,6 @@ namespace Revoker_FS12.FCS
 			cRollPitchFFAoA = dev.Bind("4. Gains", "RollPitchFeedForwardMaxAoA", 35f, "RollPitchFeedForward fades out over the 15 deg below this |AoA| and is off above it: post-stall the stabilators have no pitch authority to redistribute and the pass would only compete for the surfaces holding the jet in yaw.");
 			cCoupFF = dev.Bind("4. Gains", "InertialCouplingFF", 0f, "Feed-forward of the gyroscopic roll/pitch/yaw coupling (w x Iw) between commanded and present rates. 0 = off (default since 1.8.14: evaluated at the commanded rates it arrives as a nose-down step the instant you roll, before the jet has the rates; the INDI loop already measures the real coupling).");
 			cRelPitchPrio = dev.Bind("4. Gains", "ReleasedStickPitchPriority", 30f, "Stick released (zero-rate hold): when the pitch rate starts to leave the hold, the allocator weights pitch this many times harder against roll/yaw for the stabilators, so a roll cannot pull them into a nose-down shove. Scales in with the pitch-rate error (1 to 9 deg/s) and out with stick (fully off from 18% stick) and with stabilator stall. 1 = off (pre-1.8.14).");
-			cRelStabRate = dev.Bind("4. Gains", "ReleasedStickStabRateBound", 0.1f, "Stick released: each allocation may only ask the stabilators for what their servos reach in this many seconds, so the nozzles and wing surfaces are never placed against a stabilator position that is still a third of a second away. Relaxes with stick and stabilator stall. 0 = off (pre-1.8.14).");
 			cWashSlew = dev.Bind("4. Gains", "RollNozzleWashoutSlew", 5f, "RollNozzleHold hands the nozzles' pitch trim to the stabs during rolls. While a stab is on its stop that handover is blocked and builds up; this caps how fast it is then applied (deg of nozzle per second), so it cannot all land in one frame the moment the stabs come off the stop - which is when they are braking the roll. 0 = uncapped (pre-1.8.15).");
 			cMomLead = dev.Bind("4. Gains", "ReleasedStickMomentLead", 0.035f, "1.8.31: 0.035 (was 0.07; with any control delay 0.07 rang for 1-2 s after a pitch stop). Stick released, zero-rate hold established: the INDI pitch loop leads its measured effector moment by this many seconds of its own rate of change, covering the servo/filter lag when the trim moment is ramping (AoA bleeding off after a hard pull). Fades in over 0.2 s; off with stick, while the pitch-rate command is moving, in AoA protection and with stab stall. 0 = off (pre-1.8.16). Above ~0.1 s it starts to wobble.");
 			cStabTrim = dev.Bind("4. Gains", "StabilatorTrimCost", 0.0002f, "Revoker 0.1.0: 0.0002 (F-22E/Ifrit 0.004): the canards carry the steady pitch (held turns, rolls) and the nozzle the transients. Allocator cost of symmetric (pitch) stabilator deflection relative to the nozzles. Higher = steady trim / sustained pitch rate carried by TVC, stabs kept for transients and whatever TVC cannot hold.");
@@ -1715,8 +1748,8 @@ namespace Revoker_FS12.FCS
 			cKpG = dev.Bind("4. Gains", "GGain", 2.5f, "G command bandwidth (1/s): load error is converted to AoA error through the live lift slope.");
 			cKiG = dev.Bind("4. Gains", "GIntegral", 1f, "G command integral gain (1/s^2), removes steady load error.");
 			cActuator = dev.Bind("5. Airframe", "ActuatorSpeedScale", 1f, "Servo speed multiplier for every control surface and the TVC nozzles (Aryx's servos run at 70 deg/s; 1.428571 = 100 deg/s).");
-			cStabUp = dev.Bind("5. Airframe", "StabilatorRangeTEUp", 45f, "Revoker 0.2.7: 45 (the canards; stock 40). Canard travel, trailing edge up (deg). 0 = the stock travel.");
-			cStabDn = dev.Bind("5. Airframe", "StabilatorRangeTEDown", 45f, "Revoker 0.2.7: 45 (the canards; stock 40). Canard travel, trailing edge down (deg). 0 = the stock travel.");
+			cStabUp = dev.Bind("5. Airframe", "StabilatorRangeTEUp", 60f, "Revoker 0.2.19: 60 (0.2.17-0.2.18: 70; 0.2.16: 80; 0.2.7-0.2.15: 45; stock 40; migrated once). Canard travel, trailing edge up = leading edge down (deg, up to 80). The + side of the canard telemetry (canL / canR): at +45..70 deg AoA a +40 deg canard sits at ~+8 deg local AoA. On the runway full push and the rollout brake each go to this stop. 0 = the stock travel.");
+			cStabDn = dev.Bind("5. Airframe", "StabilatorRangeTEDown", 45f, "Revoker 0.2.7: 45 (stock 40; 0.2.14-0.2.15 had 80 here, the wrong side). Canard travel, trailing edge down = leading edge up (deg, up to 80): the - side of the canard telemetry, the side the canards sit on in a push (at -45..-56 deg AoA a -40 deg canard sits at ~-14 deg local AoA). AoALimitNegative 55 was set with this at 45 (stock 40: -50). 0 = the stock travel.");
 			cFlapRange = dev.Bind("5. Airframe", "FlaperonRange", 30f, "Ifrit 0.3.0: travel each way for the ailerons (outer) and decelerons (inner) (deg). Stock: ailerons 30, decelerons 20. 0 = stock.");
 			cServoSpeed = dev.Bind("5. Airframe", "SurfaceServoSpeed", 100f, "Ifrit 0.3.0: servo speed of every control surface (deg/s), the F-22E FCS's 100. Stock: stabilators 60, ailerons 45, decelerons 70. 0 = the stock speeds x ActuatorSpeedScale. TVC: TvcSlewRate.");
 			cSplitRange = dev.Bind("5. Airframe", "SplitRange", 0f, "Ifrit 0.3.0: deceleron split limit (deg), for the airbrake and for split yaw. 0 = the decelerons' own travel (FlaperonRange, 30); the stock limit is 25. Split drag is split x splitDrag x rho x v^2, so 30 is 20 % more than 25.");
@@ -1808,7 +1841,7 @@ namespace Revoker_FS12.FCS
 			// Revoker 0.2.0: one-time move of the 0.1.0 defaults that changed (AoALimitPositive 65 -> 70, ElevonPitch false ->
 			// true). A dev file written by 0.1.0 has no RevokerConfigRevision line; values set by hand to anything else stay.
 			bool revOld = devUnlocked && !devFresh && !FileHasKey(dev.ConfigFilePath, "RevokerConfigRevision");
-			cRevokerRev = dev.Bind("2. Envelope", "RevokerConfigRevision", 6, "Internal: the Revoker config revision this file was last updated to. Leave it alone.");
+			cRevokerRev = dev.Bind("2. Envelope", "RevokerConfigRevision", 15, "Internal: the Revoker config revision this file was last updated to. Leave it alone.");
 			if (revOld)
 			{
 				cRevokerRev.Value = 0;
@@ -1905,7 +1938,156 @@ namespace Revoker_FS12.FCS
 				}
 				Log.LogInfo("Revoker FCS 0.2.9 defaults: GroundRotationRamp 600 (from 60), once.");
 			}
+			// Revoker 0.2.13: PullSideslipMargin 15 -> 9, once (only if it was exactly 15)
+			if (cRevokerRev.Value < 7)
+			{
+				// Revoker FCS 0.3.0: PullSideslipMargin is gone (the reference governor replaced the rolling-pull governor); the revision still advances
+				cRevokerRev.Value = 7;
+				if (devUnlocked)
+				{
+					dev.Save();
+				}
+				Log.LogInfo("Revoker FCS 0.2.13 defaults: (PullSideslipMargin retired in 0.3.0).");
+			}
+			// Revoker 0.2.14: canard travel trailing edge down (leading edge up) 45 -> 80, once (only if it was exactly 45)
+			if (cRevokerRev.Value < 8)
+			{
+				if (Mathf.Abs(cStabDn.Value - 45f) < 0.001f)
+				{
+					cStabDn.Value = 80f;
+				}
+				cRevokerRev.Value = 8;
+				if (devUnlocked)
+				{
+					dev.Save();
+				}
+				Log.LogInfo("Revoker FCS 0.2.14 defaults: StabilatorRangeTEDown 80 (from 45), once.");
+			}
+			// Revoker 0.2.16: 0.2.14 extended the wrong side. Leading edge DOWN (trailing edge up, the + side) gets the 80, leading
+			// edge up goes back to 45, once (only from the exact 0.2.14/0.2.15 pair 45 / 80; anything else set by hand is kept)
+			if (cRevokerRev.Value < 9)
+			{
+				if (Mathf.Abs(cStabUp.Value - 45f) < 0.001f && Mathf.Abs(cStabDn.Value - 80f) < 0.001f)
+				{
+					cStabUp.Value = 80f;
+					cStabDn.Value = 45f;
+				}
+				cRevokerRev.Value = 9;
+				if (devUnlocked)
+				{
+					dev.Save();
+				}
+				Log.LogInfo("Revoker FCS 0.2.16 defaults: canard travel leading edge down 80 / leading edge up 45 (StabilatorRangeTEUp 80, StabilatorRangeTEDown 45; was 45 / 80), once.");
+			}
+			// Revoker 0.2.17: canard travel leading edge down 80 -> 70, once, leading edge up kept at 45 (from the exact 0.2.16 pair 80 / 45,
+			// or 70 / 35 from a withdrawn first 0.2.17 build; anything else set by hand is kept)
+			if (cRevokerRev.Value < 11)
+			{
+				bool from216 = Mathf.Abs(cStabUp.Value - 80f) < 0.001f && Mathf.Abs(cStabDn.Value - 45f) < 0.001f;
+				bool fromWithdrawn = Mathf.Abs(cStabUp.Value - 70f) < 0.001f && Mathf.Abs(cStabDn.Value - 35f) < 0.001f;
+				if (from216 || fromWithdrawn)
+				{
+					cStabUp.Value = 70f;
+					cStabDn.Value = 45f;
+				}
+				cRevokerRev.Value = 11;
+				if (devUnlocked)
+				{
+					dev.Save();
+				}
+				Log.LogInfo("Revoker FCS 0.2.17 defaults: canard travel leading edge down 70 / leading edge up 45 (StabilatorRangeTEUp 70, StabilatorRangeTEDown 45), once.");
+			}
+			// Revoker 0.2.18: GroundBrakeCanard 45 -> 80 (= the full leading-edge-down travel), once (only if it was exactly 45)
+			if (cRevokerRev.Value < 12)
+			{
+				if (Mathf.Abs(cGbCan.Value - 45f) < 0.001f)
+				{
+					cGbCan.Value = 80f;
+				}
+				cRevokerRev.Value = 12;
+				if (devUnlocked)
+				{
+					dev.Save();
+				}
+				Log.LogInfo("Revoker FCS 0.2.18 defaults: GroundBrakeCanard 80 (full leading-edge-down travel; from 45), once.");
+			}
+			// Revoker 0.2.19: canard leading-edge-down travel 70 -> 60, once (only if it was exactly 70)
+			if (cRevokerRev.Value < 13)
+			{
+				if (Mathf.Abs(cStabUp.Value - 70f) < 0.001f)
+				{
+					cStabUp.Value = 60f;
+				}
+				cRevokerRev.Value = 13;
+				if (devUnlocked)
+				{
+					dev.Save();
+				}
+				Log.LogInfo("Revoker FCS 0.2.19 defaults: canard travel leading edge down 60 (StabilatorRangeTEUp; from 70), once.");
+			}
+			// Revoker 0.2.21: inboard elevon reversal AoA 32 -> 37, once (only if it was exactly 32)
+			if (cRevokerRev.Value < 14)
+			{
+				if (Mathf.Abs(cStallInner.Value - 32f) < 0.001f)
+				{
+					cStallInner.Value = 37f;
+				}
+				cRevokerRev.Value = 14;
+				if (devUnlocked)
+				{
+					dev.Save();
+				}
+				Log.LogInfo("Revoker FCS 0.2.21 defaults: InnerElevonReversalAoA 37 (from 32), once.");
+			}
+			// Revoker 0.2.22: knee-preserving stagger; inboard elevon reversal AoA 37 -> 26, once (only if it was exactly 37)
+			if (cRevokerRev.Value < 15)
+			{
+				if (Mathf.Abs(cStallInner.Value - 37f) < 0.001f)
+				{
+					cStallInner.Value = 26f;
+				}
+				cRevokerRev.Value = 15;
+				if (devUnlocked)
+				{
+					dev.Save();
+				}
+				Log.LogInfo("Revoker FCS 0.2.22 defaults: InnerElevonReversalAoA 26 (from 37; knee-preserving stagger), once.");
+			}
 			MigrateOldConfig(cfg, dev, devUnlocked && devFresh);
+			MigrateGovernorKeys(cfg, devUnlocked ? dev : null);
+			// Revoker FCS 0.4.0: RollStopSideslip default 4 -> 8; a player file written by 0.3.0 still holding exactly 4 is moved once, a value set by hand is kept
+			if (cGovRev.Value < 1)
+			{
+				if (Mathf.Abs(cRollStopSlip.Value - 4f) < 0.001f)
+				{
+					cRollStopSlip.Value = 8f;
+				}
+				cGovRev.Value = 1;
+				cfg.Save();
+				Log.LogInfo($"Revoker FCS 0.4.0 defaults: RollStopSideslip {cRollStopSlip.Value} (4 -> 8 unless set by hand).");
+			}
+			// Revoker FCS 0.7.0: RollStopSideslip default 8 -> 6; a file still holding exactly 8 is moved once, a value set by hand is kept
+			if (cGovRev.Value < 2)
+			{
+				if (Mathf.Abs(cRollStopSlip.Value - 8f) < 0.001f)
+				{
+					cRollStopSlip.Value = 6f;
+				}
+				cGovRev.Value = 2;
+				cfg.Save();
+				Log.LogInfo($"Revoker FCS 0.7.0 defaults: RollStopSideslip {cRollStopSlip.Value} (8 -> 6 unless set by hand).");
+			}
+			// Revoker FCS 0.8.1: RollPaceRateBlend default 0.4 -> 0.65; a file still holding exactly 0.4 is moved once, a value set by hand is kept
+			if (cGovRev.Value < 3)
+			{
+				if (Mathf.Abs(cRollPaceRateBlend.Value - 0.4f) < 0.0001f)
+				{
+					cRollPaceRateBlend.Value = 0.65f;
+				}
+				cGovRev.Value = 3;
+				cfg.Save();
+				Log.LogInfo($"Revoker FCS 0.8.1 defaults: RollPaceRateBlend {cRollPaceRateBlend.Value} (0.4 -> 0.65 unless set by hand).");
+			}
 			// Ifrit 0.2.0: 0.1.0 ran the F-22E 2.0.3 airframe migration and wrote 1.2 into the (unused) effectiveness keys; reset
 			// them once. The Ifrit airframe is never effectiveness-scaled.
 			// Ifrit 0.2.1: the rollout aero-brake is off; the split decelerons are the airbrake on the ground too
@@ -1962,10 +2144,7 @@ namespace Revoker_FS12.FCS
 					{
 						cTvcDiffMu.Value = 0.003f;
 					}
-					if (Mathf.Abs(cPullSlipMargin.Value - 9f) < 0.001f)
-					{
-						cPullSlipMargin.Value = 15f;
-					}
+					// Revoker FCS 0.3.0: PullSideslipMargin is gone (the reference governor replaced the rolling-pull governor); the revision still advances
 					if (Mathf.Abs(cSlipGainA0.Value - 25f) < 0.001f)
 					{
 						cSlipGainA0.Value = 5f;
@@ -2051,15 +2230,12 @@ namespace Revoker_FS12.FCS
 			// set by hand is kept
 			if (cAirframeRev.Value < 7)
 			{
-				if (Mathf.Abs(cPullSlipMargin.Value - 6f) < 0.001f)
-				{
-					cPullSlipMargin.Value = 9f;
-				}
+				// Revoker FCS 0.3.0: PullSideslipMargin is gone (the reference governor replaced the rolling-pull governor); the revision still advances
 				if (Mathf.Abs(cPullRollTrade.Value) < 0.0001f)
 				{
 					cPullRollTrade.Value = 0.7f;
 				}
-				Log.LogInfo($"Revoker FCS 0.3.0 (F-22E 2.2.23) defaults: PullSideslipMargin {cPullSlipMargin.Value}, PullRollTrade {cPullRollTrade.Value}.");
+				Log.LogInfo($"Revoker FCS 0.3.0 (F-22E 2.2.23) defaults: PullRollTrade {cPullRollTrade.Value} (PullSideslipMargin retired).");
 				cAirframeRev.Value = 7;
 				if (devUnlocked)
 				{
@@ -2202,6 +2378,88 @@ namespace Revoker_FS12.FCS
 
 		public static bool DevUnlocked { get; private set; }
 
+		// Revoker FCS 0.3.0 (F-22E 2.6.0): PullRollTrade moved from the Dev file to the player file (section "6. Lateral governor"); the
+		// retired rolling-pull devices' keys (AoASweepYawLimit, AoASweepYawLimitPositive, PullSideslipMargin, PullFFBoostMax,
+		// PullGovSmooth) are gone. Once, the Dev file's leftover value of the moved key is carried into the player file; the
+		// leftovers are then dropped with the other orphans.
+		private static readonly string[] GovMovedKeys = new string[] { "PullRollTrade", "RollStopSideslip", "RollGovernorPitch", "RollPaceRateSlip", "RollPaceRateBlend", "RollStopSlipProbe" };
+		// 2.44.1: Dev keys of devices that are gone, dropped from the Dev file once (no value carried): section / key
+		private static readonly string[][] RetiredDevKeys = new string[][] { new string[] { "4. Gains", "ReleasedStickStabRateBound" } };
+		private static void MigrateGovernorKeys(ConfigFile cfg, ConfigFile dev)
+		{
+			if (dev == null)
+			{
+				return;
+			}
+			try
+			{
+				var prop = typeof(ConfigFile).GetProperty("OrphanedEntries", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+				if (!(prop?.GetValue(dev) is Dictionary<ConfigDefinition, string> orph) || orph.Count == 0)
+				{
+					return;
+				}
+				int n = 0;
+				int dropped = 0;
+				int retired = 0;
+				foreach (KeyValuePair<ConfigDefinition, string> o in new List<KeyValuePair<ConfigDefinition, string>>(orph))
+				{
+					bool isRetired = false;
+					foreach (string[] rk in RetiredDevKeys)
+					{
+						if (o.Key.Section == rk[0] && o.Key.Key == rk[1]) { isRetired = true; break; }
+					}
+					if (isRetired)
+					{
+						orph.Remove(o.Key);
+						retired++;
+						continue;
+					}
+					if (o.Key.Section != "3. Lateral-directional")
+					{
+						continue;
+					}
+					if (Array.IndexOf(GovMovedKeys, o.Key.Key) >= 0)
+					{
+						foreach (ConfigDefinition def in cfg.Keys)
+						{
+							if (def.Section == "6. Lateral governor" && def.Key == o.Key.Key)
+							{
+								try
+								{
+									ConfigEntryBase e = cfg[def];
+									e.BoxedValue = TomlTypeConverter.ConvertToValue(o.Value, e.SettingType);
+									n++;
+								}
+								catch
+								{
+								}
+							}
+						}
+					}
+					orph.Remove(o.Key);
+					dropped++;
+				}
+				if (retired > 0 && dropped == 0)
+				{
+					dev.Save();
+				}
+				if (retired > 0)
+				{
+					Log.LogInfo($"F-22E FCS: {retired} retired device key(s) dropped from the dev file.");
+				}
+				if (dropped > 0)
+				{
+					dev.Save();
+					cfg.Save();
+					Log.LogInfo($"Revoker FCS 0.3.0: lateral governor keys moved to the player config ({n} values carried over, {dropped} old lateral keys dropped from the dev file).");
+				}
+			}
+			catch (Exception ex)
+			{
+				Log.LogWarning("Revoker FCS 0.3.0 governor key migration: " + ex.Message);
+			}
+		}
+
 		private static void DropOrphans(ConfigFile f, bool save)
 		{
 			try
@@ -2334,6 +2592,10 @@ namespace Revoker_FS12.FCS
 			TryPatch(h, "Hardpoint.ModifyMass", delegate
 			{
 				h.Patch(AccessTools.Method(typeof(Hardpoint), "ModifyMass"), null, new HarmonyMethod(typeof(FuelBalance), "HardpointMassPostfix"));
+			});
+			TryPatch(h, "AeroJobSettings.Schedule", delegate
+			{
+				h.Patch(AccessTools.Method(typeof(AeroJobSettings), "Schedule"), new HarmonyMethod(typeof(StallStaggerJobs), "SchedulePrefix"));
 			});
 			TryPatch(h, "HighLiftDevice.FixedUpdate", delegate
 			{

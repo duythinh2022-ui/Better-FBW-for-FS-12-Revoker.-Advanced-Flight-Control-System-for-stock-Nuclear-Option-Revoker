@@ -50,6 +50,16 @@ namespace Revoker_FS12.FCS
 			{
 				return Fam.None;
 			}
+			// Revoker 0.2.20: the FS-12's trailing-edge elevon parts (lower case): aileron_L/R = outboard, flap_L/R = inboard.
+			// The canards keep their own foil (no family).
+			if (name.StartsWith("aileron_") && !name.Contains("visible"))
+			{
+				return Fam.Outer;
+			}
+			if (name.StartsWith("flap_") && !name.Contains("visible"))
+			{
+				return Fam.Inner;
+			}
 			if (name.Contains("Elevator"))
 			{
 				return Fam.Stab;
@@ -89,7 +99,7 @@ namespace Revoker_FS12.FCS
 			{
 				return (af == null ? 0 : af.GetHashCode()) + "|" + (int)f + "|" + BodyLift.KeyPart(f);
 			}
-			return (af == null ? 0 : af.GetHashCode()) + "|" + (int)f + "|" + PeakFor(f).ToString("F2") + "|" + Plugin.StallStaggerLiftSlope.ToString("F3");
+			return (af == null ? 0 : af.GetHashCode()) + "|" + (int)f + "|" + PeakFor(f).ToString("F2") + "|knee";
 		}
 
 		// peak AoA (deg, magnitude) of a lift curve on one side (sign +1 / -1), searched 2..89 deg
@@ -108,6 +118,86 @@ namespace Revoker_FS12.FCS
 			return bestA;
 		}
 
+		// Revoker 0.2.22: the knee of a lift curve on one side (deg, magnitude): the first local minimum of the lift slope after its
+		// steepest point, below the peak, if that minimum is under 25 % of the steepest slope (Fighter1_wing: the 17.19 deg keyframe,
+		// slope 0.15 against 3.8 /rad, recovering to ~0.4 above it); else where the slope first falls under 15 % of it; 0 if neither
+		// (no knee: the whole curve below the peak is compressed).
+		public static float FindKneeDeg(Func<float, float> clOfRad, int sign, float peakDeg)
+		{
+			const float h = 0.25f;
+			int n = Mathf.FloorToInt((peakDeg - 0.5f) / h);
+			if (n < 4)
+			{
+				return 0f;
+			}
+			float[] sl = new float[n];
+			for (int i = 0; i < n; i++)
+			{
+				float a = 0.5f + i * h;
+				sl[i] = sign * (clOfRad(sign * (a + h) * Mathf.Deg2Rad) - clOfRad(sign * (a - h) * Mathf.Deg2Rad)) / (2f * h);
+			}
+			int iMax = 0;
+			for (int i = 1; i < n; i++)
+			{
+				if (sl[i] > sl[iMax])
+				{
+					iMax = i;
+				}
+			}
+			float sMax = sl[iMax];
+			if (sMax <= 0f)
+			{
+				return 0f;
+			}
+			for (int i = iMax + 1; i < n - 1; i++)
+			{
+				if (sl[i] <= sl[i - 1] && sl[i] < sl[i + 1] && sl[i] < 0.25f * sMax)
+				{
+					return 0.5f + i * h;
+				}
+			}
+			for (int i = iMax + 1; i < n; i++)
+			{
+				if (sl[i] < 0.15f * sMax)
+				{
+					return 0.5f + i * h;
+				}
+			}
+			return 0f;
+		}
+
+		// Revoker 0.2.22: knee-preserving angle map for one side. Below the source curve's knee the curve is untouched; the plateau
+		// from the knee to the source peak P0 is compressed (or stretched) linearly onto knee..P; past P the post-peak side runs
+		// from P0 to 90 as before. Lift amplitude 1 everywhere: the peak CL is kept and nothing below the knee changes. 0.2.20-0.2.21
+		// compressed the whole curve (and with it the 17 deg knee, to 12-14 deg): roll authority -6..-30 % at 10 deg and ~-23 %
+		// at 15 deg for the inboard pair, and a lift loss above the knee.
+		public static void MapKnee(float x, float P, float P0, float knee, out float m)
+		{
+			P = Mathf.Clamp(P, 5f, 80f);
+			float k = Mathf.Min(knee, Mathf.Min(P, P0) - 2f);
+			if (k < 0f)
+			{
+				k = 0f;
+			}
+			if (x <= k)
+			{
+				m = x;
+			}
+			else if (x <= P)
+			{
+				m = k + (x - k) * (P0 - k) / Mathf.Max(0.01f, P - k);
+			}
+			else if (x <= 90f)
+			{
+				float t = (x - P) / (90f - P);
+				m = P0 + t * (90f - P0);
+			}
+			else
+			{
+				m = x;
+			}
+		}
+
 		// angle map for one side: x = |AoA| (deg), returns the source |AoA| (deg) and the lift amplitude
 		public static void Map(float x, float P, float P0, float slope, out float m, out float amp)
 		{
@@ -122,7 +212,12 @@ namespace Revoker_FS12.FCS
 			{
 				float t = (x - P) / (90f - P);
 				m = P0 + t * (90f - P0);
-				amp = aP + (1f - aP) * t;
+				// Revoker 0.2.20: the amplitude holds aP past the peak and blends back to 1 only over 80-90 deg. A linear fade from
+				// the peak (the F-22E's form, harmless at LiftSlope 0 where aP = 1) outran the flat-topped wing foil's post-peak
+				// lift drop at LiftSlope 1 and moved the peak: inboard 32 -> 39.4 deg on Fighter1_wing.
+				float tf = Mathf.Clamp01((x - 80f) / 10f);
+				tf = tf * tf * (3f - 2f * tf);
+				amp = aP + (1f - aP) * tf;
 			}
 			else
 			{
@@ -136,12 +231,15 @@ namespace Revoker_FS12.FCS
 		{
 			float p0Pos = FindPeakDeg(clOfRad, 1);
 			float p0Neg = FindPeakDeg(clOfRad, -1);
+			float kPos = FindKneeDeg(clOfRad, 1, p0Pos);
+			float kNeg = FindKneeDeg(clOfRad, -1, p0Neg);
 			for (int i = 0; i < ChartN; i++)
 			{
 				float a = (i - 64) * ChartStep;
 				float xd = Mathf.Abs(a) * Mathf.Rad2Deg;
 				int s = (a < 0f) ? -1 : 1;
-				Map(xd, P, (s > 0) ? p0Pos : p0Neg, slope, out float m, out float amp);
+				MapKnee(xd, P, (s > 0) ? p0Pos : p0Neg, (s > 0) ? kPos : kNeg, out float m);
+				float amp = 1f;
 				float src = s * m * Mathf.Deg2Rad;
 				if (xd > 90f)
 				{
@@ -169,7 +267,15 @@ namespace Revoker_FS12.FCS
 		public static AirfoilTable TableFor(AeroPart part, Airfoil af)
 		{
 			Fam f = (part != null && Enabled && af != null && af.liftCoef != null && af.dragCoef != null) ? FamilyOf(part.gameObject.name) : Fam.None;
-			if (f == Fam.None)
+			return TableForFamily(af, f);
+		}
+
+		// Revoker 0.2.20: a family's remapped table for any airfoil. Used for the camber increment a trailing-edge elevon puts on
+		// the wing section ahead of it: the increment is that elevon's circulation, so it stalls (and reverses) with the elevon,
+		// while the section's own clean lift keeps its own curve.
+		public static AirfoilTable TableForFamily(Airfoil af, Fam f)
+		{
+			if (f == Fam.None || af == null || af.liftCoef == null || af.dragCoef == null)
 			{
 				return new AirfoilTable(af);
 			}
