@@ -11,3 +11,7 @@ This FCS mod includes a fix for the outer trailing elevons which were misaligned
 [F-22E FCS mod](https://github.com/duythinh2022-ui/Advanced-flight-controls-addon-for-Aryx-s-F-22E-mod-for-Nuclear-Option.)
 
 [Ifrit FCS mod](https://github.com/duythinh2022-ui/Better-FBW-for-KR-67-Ifrit.-Advanced-Flight-Control-System-for-stock-Nuclear-Option-Ifrit)
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE)
